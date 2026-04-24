@@ -17,17 +17,6 @@ def _load_llm_module():
 llm = _load_llm_module()
 
 
-def test_parse_action_text_accepts_json_code_fence():
-    action = llm._parse_action_text(
-        "```json\n"
-        "{\"tool_name\": \"bash\", \"params\": {\"command\": \"pwd\"}}\n"
-        "```"
-    )
-
-    assert action["tool_name"] == "bash"
-    assert action["params"] == {"command": "pwd"}
-
-
 def test_detect_provider_uses_prefix_and_explicit_provider():
     assert llm.detect_provider("gpt-4o-mini") == "openai"
     assert llm.detect_provider("custom/my-model") == "custom"
@@ -77,7 +66,6 @@ def test_openai_message_builder_uses_task_input():
 
 
 def main() -> None:
-    test_parse_action_text_accepts_json_code_fence()
     test_detect_provider_uses_prefix_and_explicit_provider()
     test_messages_to_openai_keeps_text_roles()
     test_openai_message_builder_uses_task_input()

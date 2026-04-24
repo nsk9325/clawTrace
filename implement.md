@@ -76,6 +76,7 @@ Important implementation details:
 - uses neutral history -> OpenAI message conversion
 - sends tool schemas with `tool_choice="auto"`
 - reconstructs tool calls from streamed `delta.tool_calls`
+- preserves streamed `finish_reason` when the backend provides it for trace analysis
 - returns one `AssistantTurn` dataclass
 - records client-side timing:
   - `latency_ms`
@@ -161,6 +162,7 @@ Current `llm_call` fields include:
 - `prefill_time_ms`
 - `decode_time_ms`
 - `measurement`
+- `finish_reason`
 - `assistant_text_preview`
 - `tool_call_count`
 

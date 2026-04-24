@@ -68,6 +68,7 @@ Responsibilities:
 - pass tool schemas to the model
 - stream assistant text and tool-call deltas
 - reconstruct full tool calls from streamed chunks
+- preserve the model's streamed `finish_reason` for trace analysis
 - return one completed `AssistantTurn`
 - measure client-side timing:
   - `latency_ms`
@@ -155,6 +156,7 @@ Current event types:
 - `prefill_time_ms`
 - `decode_time_ms`
 - `measurement`
+- `finish_reason`
 - `assistant_text_preview`
 - `tool_call_count`
 

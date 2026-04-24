@@ -25,6 +25,17 @@ def test_load_config_returns_defaults_when_no_path():
     assert config == config_mod.DEFAULT_CONFIG
 
 
+def test_run_config_from_dict_filters_unknown_keys_and_round_trips():
+    data = {**config_mod.DEFAULT_CONFIG, "bogus_key": "ignored", "max_steps": 2}
+    cfg = config_mod.RunConfig.from_dict(data)
+
+    assert cfg.max_steps == 2
+    assert cfg.subagent_parallelism == "serial"
+    round_trip = cfg.to_dict()
+    assert "bogus_key" not in round_trip
+    assert round_trip["max_steps"] == 2
+
+
 def test_save_and_load_config_round_trip(tmp_path):
     config_path = tmp_path / "config.json"
     original = dict(config_mod.DEFAULT_CONFIG)
@@ -41,6 +52,7 @@ def test_save_and_load_config_round_trip(tmp_path):
 
 def main() -> None:
     test_load_config_returns_defaults_when_no_path()
+    test_run_config_from_dict_filters_unknown_keys_and_round_trips()
     with tempfile.TemporaryDirectory() as tmp_dir:
         test_save_and_load_config_round_trip(Path(tmp_dir))
     print("All config tests passed.")

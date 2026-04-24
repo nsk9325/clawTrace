@@ -48,6 +48,7 @@ class AssistantTurn:
     prefill_time_ms: int | None
     decode_time_ms: int | None
     measurement: str
+    finish_reason: str | None = None
 
 
 def detect_provider(model: str) -> str:
@@ -83,39 +84,6 @@ def get_base_url(provider_name: str, config: dict[str, Any]) -> str | None:
         return str(config.get("custom_base_url", "")).strip() or None
 
     return PROVIDERS.get(provider_name, {}).get("base_url")
-
-
-def _strip_code_fences(text: str) -> str:
-    cleaned = text.strip()
-    if cleaned.startswith("```"):
-        lines = cleaned.splitlines()
-        if lines and lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].strip() == "```":
-            lines = lines[:-1]
-        cleaned = "\n".join(lines).strip()
-    return cleaned
-
-
-def _parse_action_text(text: str) -> dict[str, Any]:
-    cleaned = _strip_code_fences(text)
-    data = json.loads(cleaned)
-
-    if not isinstance(data, dict):
-        raise ValueError("LLM action response must be a JSON object.")
-
-    tool_name = data.get("tool_name")
-    params = data.get("params", {})
-
-    if not isinstance(tool_name, str) or not tool_name:
-        raise ValueError("LLM action response must include a string tool_name.")
-    if not isinstance(params, dict):
-        raise ValueError("LLM action response must include params as an object.")
-
-    return {
-        "tool_name": tool_name,
-        "params": params,
-    }
 
 
 def tools_to_openai(tool_schemas: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -233,6 +201,7 @@ def run_assistant_turn(
     tool_buf: dict[int, dict[str, Any]] = {}
     prompt_tokens = 0
     completion_tokens = 0
+    finish_reason: str | None = None
 
     request_start = time.perf_counter()
     first_token_at: float | None = None
@@ -246,7 +215,10 @@ def run_assistant_turn(
         if not chunk.choices:
             continue
 
-        delta = chunk.choices[0].delta
+        choice = chunk.choices[0]
+        delta = choice.delta
+        if choice.finish_reason:
+            finish_reason = choice.finish_reason
 
         if delta.content:
             if first_token_at is None:
@@ -297,4 +269,5 @@ def run_assistant_turn(
         prefill_time_ms=ttft_ms,
         decode_time_ms=decode_time_ms,
         measurement="client_streaming",
+        finish_reason=finish_reason,
     )

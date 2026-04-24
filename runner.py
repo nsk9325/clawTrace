@@ -8,7 +8,10 @@ from engine import run_episode
 def main() -> None:
     task_input = " ".join(sys.argv[1:]).strip()
     try:
-        result = run_episode(task_input=task_input)
+        result = run_episode(
+            task_input=task_input,
+            config={"allow_parallel_tools": True, "max_parallel_tools": 4},
+        )
     except Exception as exc:
         print(f"Error: {exc}")
         return
