@@ -13,16 +13,12 @@ def utc_timestamp() -> str:
 
 def make_event(
     event_type: str,
-    episode_id: str,
-    run_id: str,
     step_id: int | None = None,
     **fields: Any,
 ) -> dict[str, Any]:
     event = {
         "timestamp": utc_timestamp(),
         "type": event_type,
-        "episode_id": episode_id,
-        "run_id": run_id,
         "step_id": step_id,
     }
     event.update(fields)

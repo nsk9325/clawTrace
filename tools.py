@@ -12,7 +12,7 @@ from typing import Any, Callable
 class ToolDef:
     name: str
     schema: dict[str, Any]
-    func: Callable[[dict[str, Any], dict[str, Any]], str]
+    func: Callable[[dict[str, Any], dict[str, Any], Any], str]
     read_only: bool = False
     concurrent_safe: bool = False
 
@@ -44,6 +44,7 @@ def execute_tool(
     name: str,
     params: dict[str, Any],
     config: dict[str, Any] | None = None,
+    context: Any = None,
 ) -> str:
     tool = get_tool(name)
     if tool is None:
@@ -53,7 +54,7 @@ def execute_tool(
     max_output = int(cfg.get("max_tool_output", 32000))
 
     try:
-        result = tool.func(params, cfg)
+        result = tool.func(params, cfg, context)
     except Exception as exc:
         return f"Error executing {name}: {exc}"
 
@@ -289,7 +290,7 @@ def _register_builtins() -> None:
                     "required": ["file_path"],
                 },
             },
-            func=lambda params, config: _read_file(
+            func=lambda params, config, context: _read_file(
                 file_path=params["file_path"],
                 limit=params.get("limit"),
                 offset=params.get("offset"),
@@ -314,7 +315,7 @@ def _register_builtins() -> None:
                     "required": ["command"],
                 },
             },
-            func=lambda params, config: _bash(
+            func=lambda params, config, context: _bash(
                 command=params["command"],
                 timeout=params.get("timeout", config.get("tool_timeout_s", 30)),
             ),
@@ -338,7 +339,7 @@ def _register_builtins() -> None:
                     "required": ["file_path", "content"],
                 },
             },
-            func=lambda params, config: _write_file(
+            func=lambda params, config, context: _write_file(
                 file_path=params["file_path"],
                 content=params["content"],
             ),
@@ -367,7 +368,7 @@ def _register_builtins() -> None:
                     "required": ["file_path", "old_string", "new_string"],
                 },
             },
-            func=lambda params, config: _edit_file(
+            func=lambda params, config, context: _edit_file(
                 file_path=params["file_path"],
                 old_string=params["old_string"],
                 new_string=params["new_string"],
@@ -393,7 +394,7 @@ def _register_builtins() -> None:
                     "required": ["pattern"],
                 },
             },
-            func=lambda params, config: _glob_tool(
+            func=lambda params, config, context: _glob_tool(
                 pattern=params["pattern"],
                 path=params.get("path"),
             ),
@@ -424,7 +425,7 @@ def _register_builtins() -> None:
                     "required": ["pattern"],
                 },
             },
-            func=lambda params, config: _grep_tool(
+            func=lambda params, config, context: _grep_tool(
                 pattern=params["pattern"],
                 path=params.get("path"),
                 glob=params.get("glob"),

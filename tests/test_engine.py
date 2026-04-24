@@ -4,6 +4,7 @@ import importlib.util
 import json
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 
@@ -32,8 +33,9 @@ def _build_executor(tmp_path, cfg_overrides=None):
     data = {**config_mod.DEFAULT_CONFIG, **(cfg_overrides or {})}
     cfg = config_mod.RunConfig.from_dict(data)
     episode = engine.Episode.new_root()
+    budget = engine.SubagentBudget(cfg)
     writer = TraceWriter(tmp_path / "exec.jsonl")
-    return engine.ToolExecutor(cfg, writer, episode), writer
+    return engine.ToolExecutor(cfg, writer, episode, budget), writer
 
 
 def test_can_parallelize_requires_allow_flag(tmp_path):
@@ -96,7 +98,7 @@ def test_parallel_tools_overlap_in_time(tmp_path):
     ]
 
     original_execute = engine.execute_tool
-    def slow_execute(name, params, cfg):
+    def slow_execute(name, params, cfg, context=None):
         time_mod.sleep(0.05)
         return "(empty file)"
     engine.execute_tool = slow_execute
@@ -364,6 +366,141 @@ def test_run_episode_ignores_finish_reason_for_loop_control(tmp_path):
     assert rows[4]["stop_reason"] is None
     assert rows[8]["stop_reason"] == "no_tool_calls"
     assert rows[9]["stop_reason"] == "no_tool_calls"
+
+
+def test_subagent_budget_depth_rejects_when_parent_depth_hits_cap():
+    import config as config_mod
+    cfg = config_mod.RunConfig.from_dict({
+        **config_mod.DEFAULT_CONFIG,
+        "max_subagent_depth": 2,
+        "max_concurrent_subagents": 0,
+    })
+    budget = engine.SubagentBudget(cfg)
+    assert budget.reserve("parent_a", parent_depth=0).ok
+    assert budget.reserve("parent_a", parent_depth=1).ok
+    rejected = budget.reserve("parent_a", parent_depth=2)
+    assert not rejected.ok
+    assert "depth" in rejected.reason
+
+
+def test_subagent_budget_concurrent_release_restores_slot():
+    import config as config_mod
+    cfg = config_mod.RunConfig.from_dict({
+        **config_mod.DEFAULT_CONFIG,
+        "max_concurrent_subagents": 1,
+    })
+    budget = engine.SubagentBudget(cfg)
+    first = budget.reserve("parent_a", parent_depth=0)
+    assert first.ok
+    second = budget.reserve("parent_a", parent_depth=0)
+    assert not second.ok
+    budget.release()
+    third = budget.reserve("parent_a", parent_depth=0)
+    assert third.ok
+
+
+def test_subagent_budget_per_parent_cap():
+    import config as config_mod
+    cfg = config_mod.RunConfig.from_dict({
+        **config_mod.DEFAULT_CONFIG,
+        "max_subagents_per_parent": 2,
+        "max_concurrent_subagents": 0,
+    })
+    budget = engine.SubagentBudget(cfg)
+    assert budget.reserve("parent_a", parent_depth=0).ok
+    assert budget.reserve("parent_a", parent_depth=0).ok
+    over = budget.reserve("parent_a", parent_depth=0)
+    assert not over.ok
+    assert "per_parent" in over.reason
+    # different parent should still have its own quota
+    assert budget.reserve("parent_b", parent_depth=0).ok
+
+
+def test_spawn_subagent_end_to_end(tmp_path):
+    import subagent as _subagent_mod  # noqa: F401 — registers spawn_subagent
+
+    trace_path = tmp_path / "parent.jsonl"
+    turns = [
+        llm.AssistantTurn(
+            text="",
+            tool_calls=[{
+                "id": "call_1", "name": "spawn_subagent",
+                "input": {"task": "do the subtask"},
+            }],
+            input_tokens=1, output_tokens=1, latency_ms=1,
+            ttft_ms=0, prefill_time_ms=0, decode_time_ms=1,
+            measurement="client_streaming",
+        ),
+        llm.AssistantTurn(
+            text="child finished the subtask", tool_calls=[],
+            input_tokens=1, output_tokens=1, latency_ms=1,
+            ttft_ms=0, prefill_time_ms=0, decode_time_ms=1,
+            measurement="client_streaming",
+        ),
+        llm.AssistantTurn(
+            text="parent done", tool_calls=[],
+            input_tokens=1, output_tokens=1, latency_ms=1,
+            ttft_ms=0, prefill_time_ms=0, decode_time_ms=1,
+            measurement="client_streaming",
+        ),
+    ]
+
+    result = _with_fake_turns(
+        turns,
+        lambda: engine.run_episode(
+            config={
+                "enable_subagents": True,
+                "max_subagent_depth": 2,
+                "max_concurrent_subagents": 4,
+                "output_dir": str(tmp_path),
+            },
+            trace_path=trace_path,
+            task_input="parent task",
+        ),
+    )
+
+    parent_rows = [json.loads(l) for l in trace_path.read_text(encoding="utf-8").splitlines()]
+    event_types = [r["type"] for r in parent_rows]
+    assert "subagent_start" in event_types
+    assert "subagent_end" in event_types
+
+    end_event = next(r for r in parent_rows if r["type"] == "subagent_end")
+    child_trace_file = Path(end_event["child_trace_path"])
+    assert child_trace_file.exists()
+
+    child_rows = [json.loads(l) for l in child_trace_file.read_text(encoding="utf-8").splitlines()]
+    first_child_event = child_rows[0]
+    assert first_child_event["depth"] == 1
+    assert first_child_event["parent_episode_id"] == result["episode_id"]
+    assert first_child_event["root_episode_id"] == result["episode_id"]
+
+
+def test_spawn_subagent_disabled_returns_error_when_called(tmp_path):
+    import subagent as _subagent_mod  # noqa: F401
+    import config as config_mod
+
+    cfg = config_mod.RunConfig.from_dict(config_mod.DEFAULT_CONFIG)
+    executor, writer = _build_executor(tmp_path)
+    try:
+        result = executor._run_one(
+            {"id": "c1", "name": "spawn_subagent", "input": {"task": "x"}},
+            step_id=0,
+            origin=time.perf_counter(),
+        )
+        assert result.exit_status == "error"
+        assert "disabled" in result.output
+    finally:
+        writer.close()
+
+
+def test_future_subagent_parallelism_modes_raise():
+    import pytest
+    for mode in ("worktree", "shared+optimistic"):
+        with pytest.raises(NotImplementedError):
+            engine.run_episode(
+                config={"subagent_parallelism": mode},
+                task_input="x",
+            )
 
 
 def main() -> None:

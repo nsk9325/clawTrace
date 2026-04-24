@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -11,6 +12,10 @@ from config import RunConfig, load_config
 from llm import AssistantTurn, run_assistant_turn
 from tools import execute_tool, get_tool, get_tool_schemas
 from trace import TraceWriter, make_event
+
+
+SUPPORTED_SUBAGENT_PARALLELISM = {"serial", "shared"}
+FUTURE_SUBAGENT_PARALLELISM = {"shared+optimistic", "worktree"}
 
 
 @dataclass(frozen=True)
@@ -34,6 +39,76 @@ class Episode:
             root_episode_id=episode_id,
         )
 
+    @classmethod
+    def new_child(cls, parent: "Episode", parent_step_id: int) -> "Episode":
+        return cls(
+            episode_id=f"episode_{uuid.uuid4().hex[:8]}",
+            run_id=f"run_{uuid.uuid4().hex[:8]}",
+            depth=parent.depth + 1,
+            root_episode_id=parent.root_episode_id,
+            parent_episode_id=parent.episode_id,
+            parent_run_id=parent.run_id,
+            parent_step_id=parent_step_id,
+        )
+
+    def to_event_fields(self) -> dict[str, Any]:
+        return {
+            "episode_id": self.episode_id,
+            "run_id": self.run_id,
+            "depth": self.depth,
+            "root_episode_id": self.root_episode_id,
+            "parent_episode_id": self.parent_episode_id,
+            "parent_run_id": self.parent_run_id,
+            "parent_step_id": self.parent_step_id,
+        }
+
+
+@dataclass(frozen=True)
+class Reservation:
+    ok: bool
+    reason: str = ""
+
+
+class SubagentBudget:
+    def __init__(self, cfg: RunConfig):
+        self._cfg = cfg
+        self._lock = threading.Lock()
+        self._total = 0
+        self._per_parent: dict[str, int] = {}
+        self._concurrent = 0
+
+    def reserve(self, parent_episode_id: str, parent_depth: int) -> Reservation:
+        with self._lock:
+            if self._cfg.max_subagent_depth > 0 and parent_depth >= self._cfg.max_subagent_depth:
+                return Reservation(False, f"max_subagent_depth ({self._cfg.max_subagent_depth}) reached")
+            if self._cfg.max_subagents_total > 0 and self._total >= self._cfg.max_subagents_total:
+                return Reservation(False, f"max_subagents_total ({self._cfg.max_subagents_total}) reached")
+            per_parent_count = self._per_parent.get(parent_episode_id, 0)
+            if self._cfg.max_subagents_per_parent > 0 and per_parent_count >= self._cfg.max_subagents_per_parent:
+                return Reservation(False, f"max_subagents_per_parent ({self._cfg.max_subagents_per_parent}) reached")
+            if self._cfg.max_concurrent_subagents > 0 and self._concurrent >= self._cfg.max_concurrent_subagents:
+                return Reservation(False, f"max_concurrent_subagents ({self._cfg.max_concurrent_subagents}) reached")
+
+            self._total += 1
+            self._per_parent[parent_episode_id] = per_parent_count + 1
+            self._concurrent += 1
+            return Reservation(True)
+
+    def release(self) -> None:
+        with self._lock:
+            if self._concurrent > 0:
+                self._concurrent -= 1
+
+
+@dataclass(frozen=True)
+class RuntimeContext:
+    episode: Episode
+    writer: TraceWriter
+    budget: SubagentBudget
+    step_id: int
+    tool_call_id: str
+    cfg: RunConfig
+
 
 @dataclass(frozen=True)
 class ToolResult:
@@ -47,10 +122,17 @@ class ToolResult:
 
 
 class ToolExecutor:
-    def __init__(self, cfg: RunConfig, writer: TraceWriter, episode: Episode):
+    def __init__(
+        self,
+        cfg: RunConfig,
+        writer: TraceWriter,
+        episode: Episode,
+        budget: SubagentBudget,
+    ):
         self.cfg = cfg
         self.writer = writer
         self.episode = episode
+        self.budget = budget
         self._cfg_dict = cfg.to_dict()
 
     def execute(self, tool_calls: list[dict[str, Any]], step_id: int) -> list[ToolResult]:
@@ -64,9 +146,16 @@ class ToolExecutor:
             return False
         for tool_call in tool_calls:
             tool_def = get_tool(tool_call["name"])
-            if tool_def is None or not tool_def.concurrent_safe:
+            if tool_def is None:
+                return False
+            if not self._tool_is_concurrent_safe(tool_def):
                 return False
         return True
+
+    def _tool_is_concurrent_safe(self, tool_def) -> bool:
+        if tool_def.name == "spawn_subagent":
+            return self.cfg.subagent_parallelism != "serial"
+        return tool_def.concurrent_safe
 
     def _execute_serial(
         self,
@@ -96,8 +185,17 @@ class ToolExecutor:
         step_id: int,
         origin: float,
     ) -> ToolResult:
+        context = RuntimeContext(
+            episode=self.episode,
+            writer=self.writer,
+            budget=self.budget,
+            step_id=step_id,
+            tool_call_id=tool_call["id"],
+            cfg=self.cfg,
+        )
+
         started = time.perf_counter()
-        output = execute_tool(tool_call["name"], tool_call["input"], self._cfg_dict)
+        output = execute_tool(tool_call["name"], tool_call["input"], self._cfg_dict, context)
         ended = time.perf_counter()
 
         started_at_ms = int((started - origin) * 1000)
@@ -108,9 +206,8 @@ class ToolExecutor:
         self.writer.write(
             make_event(
                 "tool_call",
-                episode_id=self.episode.episode_id,
-                run_id=self.episode.run_id,
                 step_id=step_id,
+                **self.episode.to_event_fields(),
                 tool_call_id=tool_call["id"],
                 tool_name=tool_call["name"],
                 params=tool_call["input"],
@@ -153,37 +250,78 @@ def _resolve_trace_path(trace_path: str | Path | None, cfg: RunConfig, episode: 
     return Path(cfg.output_dir) / f"{episode.episode_id}.jsonl"
 
 
+def _validate_subagent_parallelism(cfg: RunConfig) -> None:
+    mode = cfg.subagent_parallelism
+    if mode in FUTURE_SUBAGENT_PARALLELISM:
+        raise NotImplementedError(
+            f"subagent_parallelism='{mode}' is a future mode, not yet implemented"
+        )
+    if mode not in SUPPORTED_SUBAGENT_PARALLELISM:
+        raise ValueError(f"Unknown subagent_parallelism: '{mode}'")
+
+
+def _filter_schemas(schemas: list[dict[str, Any]], cfg: RunConfig) -> list[dict[str, Any]]:
+    if cfg.enable_subagents:
+        return schemas
+    return [s for s in schemas if s["name"] != "spawn_subagent"]
+
+
+def _final_assistant_text(history: list[dict[str, Any]]) -> str:
+    for message in reversed(history):
+        if message.get("role") == "assistant" and not message.get("tool_calls"):
+            return str(message.get("content", ""))
+    return ""
+
+
 def run_episode(
     config: dict[str, Any] | None = None,
     trace_path: str | Path | None = None,
     task_input: str = "",
+    episode: Episode | None = None,
+    budget: SubagentBudget | None = None,
 ) -> dict[str, Any]:
     merged = dict(load_config())
     if config:
         merged.update(config)
     cfg = RunConfig.from_dict(merged)
+    _validate_subagent_parallelism(cfg)
     cfg_dict = cfg.to_dict()
 
     task = _episode_task_input(task_input)
-    episode = Episode.new_root()
+    if episode is None:
+        episode = Episode.new_root()
+    if budget is None:
+        budget = SubagentBudget(cfg)
+
     trace_path = _resolve_trace_path(trace_path, cfg, episode)
 
     history: list[dict[str, Any]] = [{"role": "user", "content": task}]
     completed_steps = 0
     final_status = "completed"
     final_stop_reason = "max_steps_reached"
-    tool_schemas = get_tool_schemas()
+    tool_schemas = _filter_schemas(get_tool_schemas(), cfg)
 
     with TraceWriter(trace_path) as writer:
-        executor = ToolExecutor(cfg, writer, episode)
+        if episode.depth == 0 and cfg.subagent_parallelism != "serial":
+            writer.write(
+                make_event(
+                    "config_warning",
+                    step_id=None,
+                    **episode.to_event_fields(),
+                    field="subagent_parallelism",
+                    value=cfg.subagent_parallelism,
+                    note="parallel subagents share cwd; writes may race",
+                )
+            )
+
+        executor = ToolExecutor(cfg, writer, episode, budget)
 
         for step_id in range(cfg.max_steps):
             writer.write(
                 make_event(
                     "step_start",
-                    episode_id=episode.episode_id,
-                    run_id=episode.run_id,
                     step_id=step_id,
+                    **episode.to_event_fields(),
                     task_input=task,
                     history_length=len(history),
                 )
@@ -194,9 +332,8 @@ def run_episode(
             writer.write(
                 make_event(
                     "llm_call",
-                    episode_id=episode.episode_id,
-                    run_id=episode.run_id,
                     step_id=step_id,
+                    **episode.to_event_fields(),
                     backend=cfg.backend,
                     model=cfg.model,
                     latency_ms=assistant_turn.latency_ms,
@@ -232,9 +369,8 @@ def run_episode(
             writer.write(
                 make_event(
                     "context_update",
-                    episode_id=episode.episode_id,
-                    run_id=episode.run_id,
                     step_id=step_id,
+                    **episode.to_event_fields(),
                     history_length=len(history),
                     tool_call_count=len(assistant_turn.tool_calls),
                     executed_tool_call_count=len(tool_results),
@@ -244,9 +380,8 @@ def run_episode(
             writer.write(
                 make_event(
                     "step_end",
-                    episode_id=episode.episode_id,
-                    run_id=episode.run_id,
                     step_id=step_id,
+                    **episode.to_event_fields(),
                     action_type="assistant_turn",
                     tool_call_count=len(assistant_turn.tool_calls),
                     executed_tool_call_count=len(tool_results),
@@ -262,9 +397,8 @@ def run_episode(
         writer.write(
             make_event(
                 "episode_end",
-                episode_id=episode.episode_id,
-                run_id=episode.run_id,
                 step_id=None,
+                **episode.to_event_fields(),
                 status=final_status,
                 stop_reason=final_stop_reason,
                 step_count=completed_steps,
@@ -277,7 +411,9 @@ def run_episode(
         "run_id": episode.run_id,
         "trace_path": str(trace_path),
         "status": final_status,
+        "stop_reason": final_stop_reason,
         "step_count": completed_steps,
         "task_input": task,
         "history": history,
+        "final_text": _final_assistant_text(history),
     }

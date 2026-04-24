@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 
 from engine import run_episode
+import subagent  # noqa: F401  (registers spawn_subagent)
 
 
 def main() -> None:
@@ -10,7 +11,7 @@ def main() -> None:
     try:
         result = run_episode(
             task_input=task_input,
-            config={"allow_parallel_tools": True, "max_parallel_tools": 4},
+            config={"allow_parallel_tools": True, "max_parallel_tools": 4, "enable_subagents": True},
         )
     except Exception as exc:
         print(f"Error: {exc}")
