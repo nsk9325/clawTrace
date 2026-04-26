@@ -56,7 +56,7 @@ def execute_tool(
     try:
         result = tool.func(params, cfg, context)
     except Exception as exc:
-        return f"Error executing {name}: {exc}"
+        return f"Error: executing {name}: {exc}"
 
     if len(result) > max_output:
         first_half = max_output // 2

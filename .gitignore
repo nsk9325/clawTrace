@@ -3,3 +3,6 @@ __pycache__/
 .pytest_cache/
 traces/
 *.jsonl
+swebench-repos/
+traces-smoke-broken/
+workload.md

@@ -80,6 +80,8 @@ def _spawn_subagent(params: dict[str, Any], config: dict[str, Any], context: Any
     )
 
     started = time.perf_counter()
+    result: dict[str, Any] | None = None
+    error: str | None = None
     try:
         result = run_episode(
             config=child_config,
@@ -88,10 +90,30 @@ def _spawn_subagent(params: dict[str, Any], config: dict[str, Any], context: Any
             episode=child_episode,
             budget=budget,
         )
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
     finally:
         budget.release()
 
     duration_ms = int((time.perf_counter() - started) * 1000)
+
+    if result is not None:
+        context.writer.write(
+            make_event(
+                "subagent_end",
+                step_id=context.step_id,
+                **parent_episode.to_event_fields(),
+                tool_call_id=context.tool_call_id,
+                child_episode_id=result["episode_id"],
+                child_run_id=result["run_id"],
+                child_trace_path=result["trace_path"],
+                child_status=result["status"],
+                child_stop_reason=result["stop_reason"],
+                child_step_count=result["step_count"],
+                duration_ms=duration_ms,
+            )
+        )
+        return result["final_text"] or "(subagent produced no final text)"
 
     context.writer.write(
         make_event(
@@ -99,17 +121,17 @@ def _spawn_subagent(params: dict[str, Any], config: dict[str, Any], context: Any
             step_id=context.step_id,
             **parent_episode.to_event_fields(),
             tool_call_id=context.tool_call_id,
-            child_episode_id=result["episode_id"],
-            child_run_id=result["run_id"],
-            child_trace_path=result["trace_path"],
-            child_status=result["status"],
-            child_stop_reason=result["stop_reason"],
-            child_step_count=result["step_count"],
+            child_episode_id=child_episode.episode_id,
+            child_run_id=child_episode.run_id,
+            child_trace_path=str(child_trace_path),
+            child_status="crashed",
+            child_stop_reason="exception",
+            child_step_count=0,
             duration_ms=duration_ms,
+            error=error,
         )
     )
-
-    return result["final_text"] or "(subagent produced no final text)"
+    return f"Error: subagent crashed — {error}"
 
 
 def _register_subagent_tool() -> None:

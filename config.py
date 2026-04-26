@@ -7,7 +7,7 @@ from typing import Any
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
-    "max_steps": 8,
+    "max_steps": 20,
     "timeout_s": 300,
     "backend": "openai",
     "model": "gpt-4o-mini",
@@ -25,12 +25,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "max_concurrent_subagents": 1,
     "subagent_parallelism": "serial",
     "runs_per_task": 1,
+    "system_prompt": "agent",
+    "append_system_prompt": "",
 }
 
 
 @dataclass(frozen=True)
 class RunConfig:
-    max_steps: int = 8
+    max_steps: int = 20
     timeout_s: int = 300
     backend: str = "openai"
     model: str = "gpt-4o-mini"
@@ -48,6 +50,8 @@ class RunConfig:
     max_concurrent_subagents: int = 1
     subagent_parallelism: str = "serial"
     runs_per_task: int = 1
+    system_prompt: str = "agent"
+    append_system_prompt: str = ""
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "RunConfig":

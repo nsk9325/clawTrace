@@ -8,6 +8,8 @@ from typing import Any
 
 from openai import OpenAI
 
+from memory import Memory
+
 
 PROVIDERS: dict[str, dict[str, Any]] = {
     "openai": {
@@ -28,14 +30,6 @@ _PREFIXES = [
     ("o3", "openai"),
     ("o4", "openai"),
 ]
-
-SYSTEM_PROMPT = (
-    "You are the assistant inside ClawTrace.\n"
-    "Use the provided tools when they help you complete the task.\n"
-    "You may call zero, one, or multiple tools in a turn.\n"
-    "When you have enough information, answer normally without calling tools."
-)
-
 
 @dataclass
 class AssistantTurn:
@@ -140,9 +134,13 @@ def messages_to_openai(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return result
 
 
-def _build_openai_messages(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    neutral_messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history
-    return messages_to_openai(neutral_messages)
+def _build_openai_messages(memory: Memory) -> list[dict[str, Any]]:
+    base: list[dict[str, Any]] = (
+        [{"role": "system", "content": memory.system_prompt}] + memory.messages
+        if memory.system_prompt
+        else memory.messages
+    )
+    return messages_to_openai(base)
 
 
 def _openai_client_from_config(config: dict[str, Any]) -> tuple[OpenAI, str]:
@@ -166,13 +164,13 @@ def _openai_client_from_config(config: dict[str, Any]) -> tuple[OpenAI, str]:
 
 
 def run_assistant_turn(
-    history: list[dict[str, Any]],
+    memory: Memory,
     tool_schemas: list[dict[str, Any]],
     config: dict[str, Any],
 ) -> AssistantTurn:
     client, provider_name = _openai_client_from_config(config)
     model = str(config.get("model", "gpt-4o-mini"))
-    messages = _build_openai_messages(history)
+    messages = _build_openai_messages(memory)
 
     kwargs: dict[str, Any] = {
         "model": bare_model(model),

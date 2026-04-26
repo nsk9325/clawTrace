@@ -40,6 +40,26 @@ def test_bash_tool_runs_command():
     assert result == "hello"
 
 
+def test_execute_tool_classifies_raised_exception_as_error():
+    def raiser(params, cfg, ctx):
+        raise RuntimeError("boom")
+
+    tools.register_tool(
+        tools.ToolDef(
+            name="_test_raiser",
+            schema={
+                "name": "_test_raiser",
+                "description": "raises",
+                "input_schema": {"type": "object", "properties": {}},
+            },
+            func=raiser,
+        )
+    )
+    output = tools.execute_tool("_test_raiser", {}, {})
+    assert output.startswith("Error:")
+    assert "boom" in output
+
+
 def main() -> None:
     test_builtin_tools_are_registered()
     with tempfile.TemporaryDirectory() as tmp_dir:

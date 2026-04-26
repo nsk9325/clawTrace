@@ -21,7 +21,7 @@ Working handoff doc. Answers:
 4. Decisions We Weighed (D1–D12)
 5. The Mental Model — step loop, parallelism, trace invariants
 6. Concurrency Model Details — thread topology, lock scope, ordering, traps
-7. Config Knobs (all 18)
+7. Config Knobs (all 20)
 8. Trace Model — event types & field groupings
 9. Failure Modes & Potential Errors — enumerated
 10. What To Be Careful About
@@ -399,7 +399,7 @@ If you want deep subagent nesting, set `max_concurrent_subagents >= max_subagent
 - Trace event order in the JSONL file = order of `writer.write` calls. Under parallel execution, tool_call events for the same step may interleave in completion order (not submission order). Use `started_at_ms` / `ended_at_ms` to reason about timing; don't rely on file line order within a step.
 - `subagent_start` is written before `run_episode` is called; `subagent_end` after it returns. So child's full trace is bracketed by parent's start/end — but because the child writes to a different file, there's no direct interleaving to worry about.
 
-## 7. Config Knobs (all 18)
+## 7. Config Knobs (all 20)
 
 Grouped by what they change:
 
@@ -439,12 +439,20 @@ Grouped by what they change:
 
 | Knob | Default | Effect |
 |---|---|---|
-| `runs_per_task` | `1` | Repeated-run factor (Step 6, not yet implemented in runner) |
+| `runs_per_task` | `1` | Repeated-run factor; runner loops `run_episode` N times serially and prints per-run + aggregate timing |
+
+### System prompt
+
+| Knob | Default | Effect |
+|---|---|---|
+| `system_prompt` | `"agent"` | Registry name (`"agent"`, `"minimal"`) selects a preset from `prompts.py`; any other string is treated as a raw override and not formatted |
+| `append_system_prompt` | `""` | Free-form text appended after the resolved prompt; applies to both main agent and subagents |
 
 ## 8. Trace Model
 
 ### Event types
 
+- `episode_start` — first event in every trace; carries the run's identity and config snapshot (see fields below)
 - `step_start` — beginning of a step (history snapshot)
 - `llm_call` — one assistant turn's LLM metrics
 - `tool_call` — one tool invocation, with timing offsets
@@ -459,11 +467,24 @@ Grouped by what they change:
 
 Every event carries `depth`, `root_episode_id`, and parent linkage via `episode.to_event_fields()`.
 
+`episode_start` fields: `task_input`, `model`, `backend`, `system_prompt_name` (registry key or `"<custom>"`), `system_prompt_chars`, `cfg` (full snapshot), `workload_info` (dict | None — populated by the dispenser via the `workload_info` kwarg to `run_episode`, otherwise `null`). Subagent traces also get an `episode_start` (with `system_prompt_name="minimal"` and `workload_info=null`).
+
 `llm_call` fields: `backend`, `model`, `latency_ms`, `ttft_ms`, `prefill_time_ms`, `decode_time_ms`, `prompt_tokens`, `completion_tokens`, `finish_reason`, `assistant_text_preview`, `tool_call_count`, `measurement`.
 
 `tool_call` fields: `tool_call_id`, `tool_name`, `params`, `started_at_ms`, `ended_at_ms`, `latency_ms`, `exit_status`, `result_preview`.
 
-`subagent_end` fields: `child_episode_id`, `child_run_id`, `child_trace_path`, `child_status`, `child_stop_reason`, `child_step_count`, `duration_ms`, plus the `tool_call_id` that links to the corresponding `tool_call` event in the same step.
+**Note:** `step_start` no longer carries `task_input` — that information lives in `episode_start` (it doesn't change within an episode).
+
+`subagent_end` fields: `child_episode_id`, `child_run_id`, `child_trace_path`, `child_status`, `child_stop_reason`, `child_step_count`, `duration_ms`, plus the `tool_call_id` that links to the corresponding `tool_call` event in the same step. On a crashed child, `child_status="crashed"`, `child_stop_reason="exception"`, `child_step_count=0`, and an `error` field carries the exception name + message. `subagent_end` is always written — either success or crash — so `subagent_start` events never orphan.
+
+### Episode status values
+
+`episode_end.status` is either:
+
+- `"completed"` — the loop terminated because the assistant turn emitted no tool calls (`stop_reason="no_tool_calls"`). Natural end.
+- `"incomplete"` — the loop terminated because `step_id + 1 == max_steps` (`stop_reason="max_steps_reached"`). The episode was cut off mid-task.
+
+Consumers distinguishing "success" from "cut-off" should check `status` (not just `stop_reason`).
 
 ## 9. Failure Modes & Potential Errors
 
@@ -484,9 +505,10 @@ Enumerated so future debugging has a checklist. Most of these are low-probabilit
 
 ### Budget / subagents
 
-8. **Budget reservation leaks.** `_spawn_subagent` uses `try/finally` around `run_episode` to always call `budget.release()`. Any new code that calls `reserve` must mirror this. A leaked reservation keeps `_concurrent` high and blocks future spawns in the same tree.
+8. **Budget reservation leaks.** `_spawn_subagent` uses `try/finally` around `run_episode` to always call `budget.release()`, including when `run_episode` raises. Any new code that calls `reserve` must mirror this. A leaked reservation keeps `_concurrent` high and blocks future spawns in the same tree.
 9. **`_total` and `_per_parent` are monotonic.** They never decrement. That's intentional (lifetime caps), but means "concurrent cap reached" and "total cap reached" behave differently. A run hitting `max_subagents_total` can't recover.
 10. **Parent writes in parallel subagents (`subagent_parallelism="shared"`)**: user-accepted risk. The `config_warning` event at episode start is the paper trail. If trace analysis shows mysterious file states, check for the warning first.
+10a. **Subagent crash paths are traced.** If `run_episode` raises inside `_spawn_subagent`, the `finally` block releases the budget, and a `subagent_end` event is written with `child_status="crashed"` and an `error` field. `subagent_start` never orphans.
 
 ### Config / plumbing
 
@@ -619,15 +641,27 @@ For subagents, the fake-turns list must cover parent turns **and** child turns (
 
 ## 15. What's Next
 
-In approximate priority order:
+### Recently shipped
 
-1. **`runs_per_task`** — small loop in `runner.py`. Step 6.
-2. **vLLM backend** — this is what `vendor/providers.py` is waiting for. Swap `llm.py` to use `providers.stream()` at that point; gains 10 backends including vLLM.
-3. **Trace analysis script** — summarize a JSONL file (totals, per-step stats, tool-mix, wall-time attribution). First derived metrics: `total_llm_time_ms`, `total_tool_time_ms`, `total_wall_time_ms`, `tool_call_count_by_name`, `steps_to_completion`.
-4. **TBT (time-between-tokens)** — requires recording per-chunk arrival timestamps in `llm.py`. Then add to `llm_call` events.
-5. **SWE-bench workload dispenser** — the deliberate layer between dataset instances and `runner.py` that normalizes + shapes task inputs.
-6. **`history_policy`** — start with `"full"` (current) and `"snip_old_tool_results"` (lift from `cheetahclaws.compaction`).
-7. **Non-serial `subagent_parallelism` modes** — `"shared+optimistic"` (~40 lines, mtime detection) and/or `"worktree"` (heavier).
+- **`memory.py`** — `Memory` class owns conversational history and system prompt; engine uses append helpers instead of poking dicts directly. `messages_to_openai` stayed in `llm.py` (provider-format converter belongs with provider transport).
+- **`prompts.py`** — configurable system prompts with `"agent"` (multi-section template w/ env + git info + conditional parallel/subagent blocks) and `"minimal"` presets, raw-string overrides, `append_system_prompt`. Subagents always get `"minimal"` (hardcoded for now).
+- **`episode_start` trace event** — first event in every trace, carries `task_input`, `model`, `backend`, `system_prompt_name`, `system_prompt_chars`, full `cfg` snapshot, and `workload_info`. Subsumed the dispenser's planned `workload_info` event; `step_start` no longer duplicates `task_input`.
+- **`swebench_dispenser.py` + `profile_swebench.py`** — the SWE-bench layer. See the (now-built) design in [workload.md](workload.md). Per-instance repo convention `<repos_dir>/<instance_id>/`. Smoke-tested end-to-end against `astropy__astropy-12907`. Predictions file emitted alongside trace + diff for later eval (no Docker required).
+- **B1 fix** (`tool_call.exit_status` now correctly classifies raised exceptions as `"error"`).
+- **B3 fix** (dispenser pre-resolves `output_dir` to absolute before its per-instance chdir loop).
+
+### Up next, in approximate priority order
+
+1. **Trace analysis script** — *now the gating piece for everything else.* Summarize a JSONL file (totals, per-step stats, tool-mix, wall-time attribution). Across multiple runs from `runs_per_task` or across dispenser instances: mean/stddev of latency and token usage, grouped by `cfg.model`, `system_prompt_name`, `workload_info.repo`, etc. First derived metrics: `total_llm_time_ms`, `total_tool_time_ms`, `total_wall_time_ms`, `tool_call_count_by_name`, `steps_to_completion`. Without this, dispenser traces are write-only.
+2. **vLLM backend** — `vendor/providers.py` is waiting. Swap `llm.py` to use `providers.stream()`; gains ~10 backends including vLLM. Now genuinely valuable since the dispenser can drive many SWE-bench instances against a self-hosted model cheaply.
+3. **TBT (time-between-tokens)** — record per-chunk arrival timestamps in `llm.py`, add to `llm_call` events.
+4. **`history_policy`** — start with `"full"` (current) and `"snip_old_tool_results"` (lift from `cheetahclaws.compaction`). Memory class has the natural seam.
+5. **Non-serial `subagent_parallelism` modes** — `"shared+optimistic"` (~40 lines, mtime detection) and/or `"worktree"` (heavier).
+6. **Optional `--eval` for `profile_swebench.py`** — predictions files are already emitted; running them through `swebench.harness.run_evaluation` is ~50 lines + Docker setup. Only worth doing once trace analysis exists to correlate eval pass/fail with profiling metrics.
+
+### Stale doc warning
+
+§2 (Current Architecture) and §3 (Code Provenance) predate `memory.py`, `prompts.py`, `swebench_dispenser.py`, and `profile_swebench.py`. Module signatures (e.g. `run_assistant_turn` first arg, `run_episode` `workload_info` kwarg) and removed helpers (`_final_assistant_text`) are also out of date. A pass through §2/§3 is queued but not yet done.
 
 ## 16. How To Run
 

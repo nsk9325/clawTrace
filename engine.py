@@ -10,6 +10,8 @@ from typing import Any
 
 from config import RunConfig, load_config
 from llm import AssistantTurn, run_assistant_turn
+from memory import Memory
+from prompts import REGISTRY as PROMPT_REGISTRY, build_system_prompt
 from tools import execute_tool, get_tool, get_tool_schemas
 from trace import TraceWriter, make_event
 
@@ -266,19 +268,13 @@ def _filter_schemas(schemas: list[dict[str, Any]], cfg: RunConfig) -> list[dict[
     return [s for s in schemas if s["name"] != "spawn_subagent"]
 
 
-def _final_assistant_text(history: list[dict[str, Any]]) -> str:
-    for message in reversed(history):
-        if message.get("role") == "assistant" and not message.get("tool_calls"):
-            return str(message.get("content", ""))
-    return ""
-
-
 def run_episode(
     config: dict[str, Any] | None = None,
     trace_path: str | Path | None = None,
     task_input: str = "",
     episode: Episode | None = None,
     budget: SubagentBudget | None = None,
+    workload_info: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     merged = dict(load_config())
     if config:
@@ -295,13 +291,33 @@ def run_episode(
 
     trace_path = _resolve_trace_path(trace_path, cfg, episode)
 
-    history: list[dict[str, Any]] = [{"role": "user", "content": task}]
+    is_subagent = episode.depth > 0
+    system_prompt = build_system_prompt(cfg, is_subagent=is_subagent)
+    memory = Memory.with_initial_user(task, system_prompt=system_prompt)
+    prompt_name = (
+        "minimal" if is_subagent
+        else (cfg.system_prompt if cfg.system_prompt in PROMPT_REGISTRY else "<custom>")
+    )
     completed_steps = 0
-    final_status = "completed"
     final_stop_reason = "max_steps_reached"
     tool_schemas = _filter_schemas(get_tool_schemas(), cfg)
 
     with TraceWriter(trace_path) as writer:
+        writer.write(
+            make_event(
+                "episode_start",
+                step_id=None,
+                **episode.to_event_fields(),
+                task_input=task,
+                model=cfg.model,
+                backend=cfg.backend,
+                system_prompt_name=prompt_name,
+                system_prompt_chars=len(system_prompt),
+                cfg=cfg_dict,
+                workload_info=workload_info,
+            )
+        )
+
         if episode.depth == 0 and cfg.subagent_parallelism != "serial":
             writer.write(
                 make_event(
@@ -322,12 +338,11 @@ def run_episode(
                     "step_start",
                     step_id=step_id,
                     **episode.to_event_fields(),
-                    task_input=task,
-                    history_length=len(history),
+                    history_length=len(memory),
                 )
             )
 
-            assistant_turn: AssistantTurn = run_assistant_turn(history, tool_schemas, cfg_dict)
+            assistant_turn: AssistantTurn = run_assistant_turn(memory, tool_schemas, cfg_dict)
 
             writer.write(
                 make_event(
@@ -349,20 +364,11 @@ def run_episode(
                 )
             )
 
-            history.append({
-                "role": "assistant",
-                "content": assistant_turn.text,
-                "tool_calls": assistant_turn.tool_calls,
-            })
+            memory.append_assistant(assistant_turn.text, assistant_turn.tool_calls)
 
             tool_results = executor.execute(assistant_turn.tool_calls, step_id)
             for result in tool_results:
-                history.append({
-                    "role": "tool",
-                    "tool_call_id": result.tool_call_id,
-                    "name": result.name,
-                    "content": result.output,
-                })
+                memory.append_tool(result.tool_call_id, result.name, result.output)
 
             stop_reason = "no_tool_calls" if not assistant_turn.tool_calls else None
 
@@ -371,7 +377,7 @@ def run_episode(
                     "context_update",
                     step_id=step_id,
                     **episode.to_event_fields(),
-                    history_length=len(history),
+                    history_length=len(memory),
                     tool_call_count=len(assistant_turn.tool_calls),
                     executed_tool_call_count=len(tool_results),
                 )
@@ -394,6 +400,8 @@ def run_episode(
                 final_stop_reason = stop_reason
                 break
 
+        final_status = "completed" if final_stop_reason == "no_tool_calls" else "incomplete"
+
         writer.write(
             make_event(
                 "episode_end",
@@ -402,7 +410,7 @@ def run_episode(
                 status=final_status,
                 stop_reason=final_stop_reason,
                 step_count=completed_steps,
-                history_length=len(history),
+                history_length=len(memory),
             )
         )
 
@@ -414,6 +422,6 @@ def run_episode(
         "stop_reason": final_stop_reason,
         "step_count": completed_steps,
         "task_input": task,
-        "history": history,
-        "final_text": _final_assistant_text(history),
+        "history": memory.messages,
+        "final_text": memory.final_assistant_text(),
     }

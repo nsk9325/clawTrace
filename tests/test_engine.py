@@ -124,8 +124,8 @@ def test_parallel_tools_overlap_in_time(tmp_path):
 def _with_fake_turns(turns, fn):
     original = engine.run_assistant_turn
 
-    def fake_run_assistant_turn(history, tool_schemas, config):
-        _ = history
+    def fake_run_assistant_turn(memory, tool_schemas, config):
+        _ = memory
         _ = tool_schemas
         _ = config
         return turns.pop(0)
@@ -217,6 +217,7 @@ def test_run_episode_writes_multi_step_events(tmp_path):
     event_types = [row["type"] for row in rows]
 
     assert event_types == [
+        "episode_start",
         "step_start",
         "llm_call",
         "tool_call",
@@ -228,10 +229,10 @@ def test_run_episode_writes_multi_step_events(tmp_path):
         "step_end",
         "episode_end",
     ]
-    assert rows[1]["tool_call_count"] == 1
-    assert rows[2]["tool_name"] == "bash"
-    assert rows[2]["params"] == {"command": "printf hello"}
-    assert rows[6]["tool_call_count"] == 0
+    assert rows[2]["tool_call_count"] == 1
+    assert rows[3]["tool_name"] == "bash"
+    assert rows[3]["params"] == {"command": "printf hello"}
+    assert rows[7]["tool_call_count"] == 0
 
 
 def test_run_episode_tracks_history_and_task_input(tmp_path):
@@ -349,6 +350,7 @@ def test_run_episode_ignores_finish_reason_for_loop_control(tmp_path):
 
     assert result["step_count"] == 2
     assert event_types == [
+        "episode_start",
         "step_start",
         "llm_call",
         "tool_call",
@@ -360,12 +362,12 @@ def test_run_episode_ignores_finish_reason_for_loop_control(tmp_path):
         "step_end",
         "episode_end",
     ]
-    assert rows[1]["finish_reason"] == "stop"
-    assert rows[2]["tool_name"] == "bash"
-    assert rows[3]["executed_tool_call_count"] == 1
-    assert rows[4]["stop_reason"] is None
-    assert rows[8]["stop_reason"] == "no_tool_calls"
+    assert rows[2]["finish_reason"] == "stop"
+    assert rows[3]["tool_name"] == "bash"
+    assert rows[4]["executed_tool_call_count"] == 1
+    assert rows[5]["stop_reason"] is None
     assert rows[9]["stop_reason"] == "no_tool_calls"
+    assert rows[10]["stop_reason"] == "no_tool_calls"
 
 
 def test_subagent_budget_depth_rejects_when_parent_depth_hits_cap():
@@ -493,6 +495,218 @@ def test_spawn_subagent_disabled_returns_error_when_called(tmp_path):
         writer.close()
 
 
+def test_runs_per_task_produces_distinct_episodes(tmp_path):
+    runner = _load_module("runner", "runner.py")
+
+    turns = [
+        llm.AssistantTurn(
+            text=f"done {i}", tool_calls=[],
+            input_tokens=1, output_tokens=1, latency_ms=1,
+            ttft_ms=0, prefill_time_ms=0, decode_time_ms=1,
+            measurement="client_streaming",
+        )
+        for i in range(3)
+    ]
+
+    results = _with_fake_turns(
+        turns,
+        lambda: runner._run_all(
+            "task",
+            {"runs_per_task": 3, "output_dir": str(tmp_path)},
+        ),
+    )
+
+    assert len(results) == 3
+    episode_ids = [r[0]["episode_id"] for r in results]
+    assert len(set(episode_ids)) == 3
+    trace_files = sorted(tmp_path.glob("episode_*.jsonl"))
+    assert len(trace_files) == 3
+
+
+def test_max_steps_reached_reports_incomplete_status(tmp_path):
+    trace_path = tmp_path / "episode_incomplete.jsonl"
+    turns = [
+        llm.AssistantTurn(
+            text="",
+            tool_calls=[{"id": f"c{i}", "name": "read_file", "input": {"file_path": "x"}}],
+            input_tokens=1, output_tokens=1, latency_ms=1,
+            ttft_ms=0, prefill_time_ms=0, decode_time_ms=1,
+            measurement="client_streaming",
+        )
+        for i in range(5)
+    ]
+
+    result = _with_fake_turns(
+        turns,
+        lambda: engine.run_episode(
+            config={"max_steps": 2},
+            trace_path=trace_path,
+            task_input="x",
+        ),
+    )
+
+    assert result["status"] == "incomplete"
+    assert result["stop_reason"] == "max_steps_reached"
+    rows = [json.loads(l) for l in trace_path.read_text(encoding="utf-8").splitlines()]
+    episode_end = next(r for r in rows if r["type"] == "episode_end")
+    assert episode_end["status"] == "incomplete"
+
+
+def test_subagent_crash_emits_subagent_end_with_error(tmp_path, monkeypatch):
+    import subagent as subagent_mod  # noqa: F401 — registers spawn_subagent
+
+    trace_path = tmp_path / "parent_crash.jsonl"
+    turns = [
+        llm.AssistantTurn(
+            text="",
+            tool_calls=[{
+                "id": "call_1", "name": "spawn_subagent",
+                "input": {"task": "do it"},
+            }],
+            input_tokens=1, output_tokens=1, latency_ms=1,
+            ttft_ms=0, prefill_time_ms=0, decode_time_ms=1,
+            measurement="client_streaming",
+        ),
+        llm.AssistantTurn(
+            text="parent done after crash", tool_calls=[],
+            input_tokens=1, output_tokens=1, latency_ms=1,
+            ttft_ms=0, prefill_time_ms=0, decode_time_ms=1,
+            measurement="client_streaming",
+        ),
+    ]
+
+    original = engine.run_episode
+
+    def crashing_run_episode(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(engine, "run_episode", crashing_run_episode)
+
+    _with_fake_turns(
+        turns,
+        lambda: original(
+            config={
+                "enable_subagents": True,
+                "max_subagent_depth": 2,
+                "max_concurrent_subagents": 4,
+                "output_dir": str(tmp_path),
+            },
+            trace_path=trace_path,
+            task_input="parent task",
+        ),
+    )
+
+    rows = [json.loads(l) for l in trace_path.read_text(encoding="utf-8").splitlines()]
+    start_events = [r for r in rows if r["type"] == "subagent_start"]
+    end_events = [r for r in rows if r["type"] == "subagent_end"]
+    assert len(start_events) == len(end_events) == 1
+    assert end_events[0]["child_status"] == "crashed"
+    assert "boom" in end_events[0]["error"]
+
+
+def test_episode_start_is_first_and_carries_cfg(tmp_path):
+    trace_path = tmp_path / "episode_start.jsonl"
+    turns = [
+        llm.AssistantTurn(
+            text="done", tool_calls=[],
+            input_tokens=1, output_tokens=1, latency_ms=1,
+            ttft_ms=0, prefill_time_ms=0, decode_time_ms=1,
+            measurement="client_streaming",
+        ),
+    ]
+
+    _with_fake_turns(
+        turns,
+        lambda: engine.run_episode(
+            config={"system_prompt": "minimal"},
+            trace_path=trace_path,
+            task_input="hello",
+        ),
+    )
+
+    rows = [json.loads(l) for l in trace_path.read_text(encoding="utf-8").splitlines()]
+    assert rows[0]["type"] == "episode_start"
+    assert rows[0]["task_input"] == "hello"
+    assert rows[0]["system_prompt_name"] == "minimal"
+    assert rows[0]["system_prompt_chars"] > 0
+    assert rows[0]["cfg"]["system_prompt"] == "minimal"
+    assert rows[0]["workload_info"] is None
+
+
+def test_episode_start_marks_custom_system_prompt(tmp_path):
+    trace_path = tmp_path / "episode_custom.jsonl"
+    turns = [
+        llm.AssistantTurn(
+            text="done", tool_calls=[],
+            input_tokens=1, output_tokens=1, latency_ms=1,
+            ttft_ms=0, prefill_time_ms=0, decode_time_ms=1,
+            measurement="client_streaming",
+        ),
+    ]
+
+    _with_fake_turns(
+        turns,
+        lambda: engine.run_episode(
+            config={"system_prompt": "totally custom prompt text"},
+            trace_path=trace_path,
+            task_input="x",
+        ),
+    )
+
+    rows = [json.loads(l) for l in trace_path.read_text(encoding="utf-8").splitlines()]
+    assert rows[0]["system_prompt_name"] == "<custom>"
+
+
+def test_episode_start_workload_info_passes_through(tmp_path):
+    trace_path = tmp_path / "episode_workload.jsonl"
+    turns = [
+        llm.AssistantTurn(
+            text="done", tool_calls=[],
+            input_tokens=1, output_tokens=1, latency_ms=1,
+            ttft_ms=0, prefill_time_ms=0, decode_time_ms=1,
+            measurement="client_streaming",
+        ),
+    ]
+
+    workload = {"instance_id": "django__django-15555", "repo": "django/django"}
+    _with_fake_turns(
+        turns,
+        lambda: engine.run_episode(
+            trace_path=trace_path,
+            task_input="x",
+            workload_info=workload,
+        ),
+    )
+
+    rows = [json.loads(l) for l in trace_path.read_text(encoding="utf-8").splitlines()]
+    assert rows[0]["workload_info"] == workload
+
+
+def test_step_start_no_longer_duplicates_task_input(tmp_path):
+    trace_path = tmp_path / "episode_no_dup.jsonl"
+    turns = [
+        llm.AssistantTurn(
+            text="done", tool_calls=[],
+            input_tokens=1, output_tokens=1, latency_ms=1,
+            ttft_ms=0, prefill_time_ms=0, decode_time_ms=1,
+            measurement="client_streaming",
+        ),
+    ]
+
+    _with_fake_turns(
+        turns,
+        lambda: engine.run_episode(
+            trace_path=trace_path,
+            task_input="some task",
+        ),
+    )
+
+    rows = [json.loads(l) for l in trace_path.read_text(encoding="utf-8").splitlines()]
+    step_starts = [r for r in rows if r["type"] == "step_start"]
+    assert step_starts
+    assert all("task_input" not in r for r in step_starts)
+
+
 def test_future_subagent_parallelism_modes_raise():
     import pytest
     for mode in ("worktree", "shared+optimistic"):
@@ -510,6 +724,7 @@ def main() -> None:
         test_run_episode_writes_multi_step_events(tmp_path)
         test_run_episode_tracks_history_and_task_input(tmp_path)
         test_tool_call_event_has_timing_offsets(tmp_path)
+        test_runs_per_task_produces_distinct_episodes(tmp_path)
         test_run_episode_ignores_finish_reason_for_loop_control(tmp_path)
     print("All engine tests passed.")
 
