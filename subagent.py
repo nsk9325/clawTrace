@@ -63,7 +63,11 @@ def _spawn_subagent(params: dict[str, Any], config: dict[str, Any], context: Any
             child_config[override_key] = params[override_key]
 
     child_episode = Episode.new_child(parent_episode, parent_step_id=context.step_id)
-    child_trace_path = Path(child_config.get("output_dir", "traces")) / f"{child_episode.episode_id}.jsonl"
+    child_trace_path = (
+        Path(child_config.get("output_dir", "traces"))
+        / child_episode.root_episode_id
+        / f"{child_episode.episode_id}.jsonl"
+    )
 
     context.writer.write(
         make_event(

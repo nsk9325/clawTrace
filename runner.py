@@ -25,10 +25,12 @@ def _run_all(task_input: str, config: dict[str, Any]) -> list[tuple[dict[str, An
 
 def main() -> None:
     task_input = " ".join(sys.argv[1:]).strip()
+    # Only override defaults that the CLI is opinionated about.
+    # `enable_subagents` and `max_parallel_tools` were redundant after
+    # DEFAULT_CONFIG was tuned; `allow_parallel_tools=True` is kept here as
+    # a runner-specific opinion (DEFAULT_CONFIG leaves it False).
     config = {
         "allow_parallel_tools": True,
-        "max_parallel_tools": 4,
-        "enable_subagents": True,
     }
 
     total_start = time.perf_counter()

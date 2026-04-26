@@ -2,7 +2,7 @@
 __pycache__/
 .pytest_cache/
 traces/
-*.jsonl
+# *.jsonl
 swebench-repos/
 traces-smoke-broken/
 workload.md

@@ -249,7 +249,9 @@ def _episode_task_input(task_input: str) -> str:
 def _resolve_trace_path(trace_path: str | Path | None, cfg: RunConfig, episode: Episode) -> Path:
     if trace_path is not None:
         return Path(trace_path)
-    return Path(cfg.output_dir) / f"{episode.episode_id}.jsonl"
+    # Per-root-episode directory: parent and all children land as siblings.
+    # Folder name uses root_episode_id; filename uses each episode's own id.
+    return Path(cfg.output_dir) / episode.root_episode_id / f"{episode.episode_id}.jsonl"
 
 
 def _validate_subagent_parallelism(cfg: RunConfig) -> None:

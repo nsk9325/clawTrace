@@ -406,6 +406,8 @@ def test_subagent_budget_per_parent_cap():
     cfg = config_mod.RunConfig.from_dict({
         **config_mod.DEFAULT_CONFIG,
         "max_subagents_per_parent": 2,
+        "max_subagents_total": 0,
+        "max_subagent_depth": 0,
         "max_concurrent_subagents": 0,
     })
     budget = engine.SubagentBudget(cfg)
@@ -482,7 +484,7 @@ def test_spawn_subagent_disabled_returns_error_when_called(tmp_path):
     import config as config_mod
 
     cfg = config_mod.RunConfig.from_dict(config_mod.DEFAULT_CONFIG)
-    executor, writer = _build_executor(tmp_path)
+    executor, writer = _build_executor(tmp_path, {"enable_subagents": False})
     try:
         result = executor._run_one(
             {"id": "c1", "name": "spawn_subagent", "input": {"task": "x"}},
@@ -519,7 +521,7 @@ def test_runs_per_task_produces_distinct_episodes(tmp_path):
     assert len(results) == 3
     episode_ids = [r[0]["episode_id"] for r in results]
     assert len(set(episode_ids)) == 3
-    trace_files = sorted(tmp_path.glob("episode_*.jsonl"))
+    trace_files = sorted(tmp_path.rglob("episode_*.jsonl"))
     assert len(trace_files) == 3
 
 

@@ -6,30 +6,6 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_CONFIG: dict[str, Any] = {
-    "max_steps": 20,
-    "timeout_s": 300,
-    "backend": "openai",
-    "model": "gpt-4o-mini",
-    "temperature": 0.0,
-    "max_tokens": 512,
-    "tool_timeout_s": 30,
-    "output_dir": "traces",
-    "openai_base_url": "",
-    "allow_parallel_tools": False,
-    "max_parallel_tools": 4,
-    "enable_subagents": False,
-    "max_subagents_per_parent": 0,
-    "max_subagents_total": 0,
-    "max_subagent_depth": 0,
-    "max_concurrent_subagents": 1,
-    "subagent_parallelism": "serial",
-    "runs_per_task": 1,
-    "system_prompt": "agent",
-    "append_system_prompt": "",
-}
-
-
 @dataclass(frozen=True)
 class RunConfig:
     max_steps: int = 20
@@ -43,11 +19,11 @@ class RunConfig:
     openai_base_url: str = ""
     allow_parallel_tools: bool = False
     max_parallel_tools: int = 4
-    enable_subagents: bool = False
-    max_subagents_per_parent: int = 0
-    max_subagents_total: int = 0
-    max_subagent_depth: int = 0
-    max_concurrent_subagents: int = 1
+    enable_subagents: bool = True
+    max_subagents_per_parent: int = 2
+    max_subagents_total: int = 2
+    max_subagent_depth: int = 1
+    max_concurrent_subagents: int = 2
     subagent_parallelism: str = "serial"
     runs_per_task: int = 1
     system_prompt: str = "agent"
@@ -60,6 +36,9 @@ class RunConfig:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+DEFAULT_CONFIG: dict[str, Any] = asdict(RunConfig())
 
 
 def load_config(path: str | Path | None = None) -> dict[str, Any]:

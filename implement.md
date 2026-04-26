@@ -59,22 +59,37 @@ Non-goals:
 ## 2. Current Architecture
 
 ```text
-runner.py           CLI: one task_input → one episode
-  ├─▶ engine.py    Episode, RuntimeContext, SubagentBudget,
-  │                  ToolExecutor, run_episode
-  ├─▶ subagent.py  AgentDefinition + spawn_subagent registration
-  └─▶ (implicit)
-        config.py  RunConfig dataclass, DEFAULT_CONFIG dict,
-                     load_config / save_config
-        llm.py     OpenAI-compatible streaming, run_assistant_turn
-        tools.py   ToolDef registry + 6 built-ins
-        trace.py   TraceWriter (thread-safe), make_event
-        vendor/
-          providers.py   cheetahclaws' multi-backend streaming
+ENTRY POINTS (project root)
+  runner.py              Plain CLI: one task_input → one episode
+  profile_swebench.py    SWE-bench CLI: many instances → many episodes
+  analyzer.py            Per-trace metrics + subagent tree → analysis.txt
+  run_swebench.sh        Bash wrapper: dispense → profile → analyze
+
+CORE LOOP
+  engine.py              Episode, RuntimeContext, SubagentBudget,
+                           ToolExecutor, run_episode
+  subagent.py            spawn_subagent registration (separate file to
+                           break the circular import with engine)
+  memory.py              Memory class (history list + system_prompt field)
+  prompts.py             build_system_prompt(cfg, is_subagent), preset
+                           registry, env / git substitutions
+  llm.py                 OpenAI-compatible streaming, run_assistant_turn(memory, ...)
+  tools.py               ToolDef registry + 6 built-ins
+  trace.py               TraceWriter (thread-safe), make_event
+  config.py              RunConfig dataclass (DEFAULT_CONFIG derived)
+
+SWE-BENCH LAYER
+  swebench_dispenser.py  Workload, characterize, select, build_workload,
+                           reset_repo, capture_diff, write_predictions
+
+VENDOR
+  vendor/providers.py    cheetahclaws' multi-backend streaming
                            (vendored, unused — reserved for vLLM)
 ```
 
-### `engine.py` (419 lines)
+**Trace dir layout:** one folder per root episode. `traces/episode_<root_id>/` holds the root `.jsonl`, all subagent `.jsonl` siblings, plus dispenser-emitted `.diff` / `.predictions.json` and analyzer-emitted `.analysis.txt`.
+
+### `engine.py` (~430 lines)
 
 Main agentic loop. Owns:
 
@@ -86,29 +101,52 @@ Main agentic loop. Owns:
 - `ToolExecutor` — wraps tool dispatch. Holds `(cfg, writer, episode, budget, _cfg_dict)`. `execute(tool_calls, step_id)` picks `_execute_serial` or `_execute_parallel` via `_can_parallelize`. Parallel uses a fresh `ThreadPoolExecutor` per step (context-manager scope; threads don't persist across steps). `_tool_is_concurrent_safe(tool_def)` consults `cfg.subagent_parallelism` as a special case for `spawn_subagent`.
 - `_validate_subagent_parallelism(cfg)` — called at `run_episode` entry. Raises `NotImplementedError` for future modes, `ValueError` for typos.
 - `_filter_schemas(schemas, cfg)` — removes `spawn_subagent` from LLM-visible schemas when `enable_subagents=False`.
-- `_final_assistant_text(history)` — reverse-scans for the last assistant message with no tool_calls; used as the subagent's return value.
-- `run_episode(config, trace_path, task_input, episode=None, budget=None)` — the step loop. The two optional args let subagents reuse the same function recursively. When `episode` is None, creates a root; when given, reuses the child Episode built by `_spawn_subagent`. Same pattern for `budget`.
+- `_resolve_trace_path(trace_path, cfg, episode)` — when no explicit path is given, returns `<output_dir>/<root_episode_id>/<episode_id>.jsonl`. Folder name uses `root_episode_id`; filename uses `episode_id`. For root, those are equal; for children, they differ — both land in the same per-root-episode dir.
+- `run_episode(config, trace_path, task_input, episode=None, budget=None, workload_info=None)` — the step loop. `episode` and `budget` defaults let subagents reuse the function recursively. `workload_info` (any dict, default `None`) is merged into the `episode_start` event for dispenser-driven runs. Built once at episode start: resolves the system prompt (`prompts.build_system_prompt(cfg, is_subagent=episode.depth > 0)`), constructs `Memory.with_initial_user(task, system_prompt=...)`, then writes `episode_start` as the very first trace event.
 
-Module-level state: `SUPPORTED_SUBAGENT_PARALLELISM`, `FUTURE_SUBAGENT_PARALLELISM` (frozenset-ish sets of mode strings).
+Module-level state: `SUPPORTED_SUBAGENT_PARALLELISM`, `FUTURE_SUBAGENT_PARALLELISM` (mode-string sets).
 
-### `llm.py` (273 lines)
+### `memory.py` (~45 lines)
 
-OpenAI-compatible streaming. Unchanged since Step 1 hygiene pass. We vendored cheetahclaws' `providers.py` but kept `llm.py` as the OpenAI path — we'll switch when we wire vLLM, not before (see decision D2 below).
+`Memory` dataclass — owns the conversational history for one episode. Provider-agnostic; no OpenAI knowledge.
+
+- Fields: `messages: list[dict[str, Any]]`, `system_prompt: str`.
+- `Memory.with_initial_user(content, system_prompt)` — episode-start constructor.
+- `append_assistant(text, tool_calls)` / `append_tool(tool_call_id, name, content)` — the two write paths used by `run_episode`.
+- `final_assistant_text()` — reverse-scans for the last assistant message with no tool_calls; used as the subagent's return value (replaces the old `engine._final_assistant_text` helper).
+- `__len__` — so `len(memory)` works in `history_length` trace fields.
+
+### `prompts.py` (~100 lines)
+
+System-prompt construction. Inputs: `cfg: RunConfig`, `is_subagent: bool`. Output: a `str`.
+
+- `MINIMAL` — a static 4-line prompt; the subagent default.
+- `AGENT_TEMPLATE` — multi-section template with `{date}`, `{cwd}`, `{platform}`, `{git_info}`, `{parallel_tools_block}`, `{subagents_block}` slots.
+- `PARALLEL_TOOLS_BLOCK`, `SUBAGENTS_BLOCK` — text fragments injected when the corresponding cfg flag is on. Empty otherwise.
+- `REGISTRY: dict[str, str]` — preset name → template. Currently `"minimal"` and `"agent"`.
+- `build_system_prompt(cfg, is_subagent=False)` — picks `"minimal"` if subagent, else `cfg.system_prompt`. If the name is in REGISTRY, runs `.format()` with substitutions; otherwise treats `cfg.system_prompt` as a raw override (no format, no crash on stray braces). Then appends `cfg.append_system_prompt` if non-empty.
+- `_git_info()` — runs `git rev-parse --abbrev-ref HEAD` with a 2-second timeout, returns `"- Git branch: <name>\n"` or `""` on any failure (non-repo, missing git, timeout).
+
+Built once at episode start (engine stores the result on `Memory.system_prompt`), so git only runs once per episode.
+
+### `llm.py` (~270 lines)
+
+OpenAI-compatible streaming. Imports `Memory` from `memory.py`; signature changed in the memory.py refactor.
 
 Public surface:
 
 - `AssistantTurn` dataclass — `(text, tool_calls, input_tokens, output_tokens, latency_ms, ttft_ms, prefill_time_ms, decode_time_ms, measurement, finish_reason)`.
-- `run_assistant_turn(history, tool_schemas, config) -> AssistantTurn` — one LLM call, streaming.
+- `run_assistant_turn(memory: Memory, tool_schemas, config) -> AssistantTurn` — one LLM call, streaming. Reads `memory.messages` and `memory.system_prompt`.
 - `detect_provider(model)` — prefix-based provider detection (`gpt-`, `o1`, `o3`, `o4` → openai; `provider/model` slash syntax → explicit provider).
 - `messages_to_openai(messages)` — neutral → OpenAI format converter.
 - `tools_to_openai(tool_schemas)` — reshape `{name, description, input_schema}` → `{type: function, function: {name, description, parameters}}`.
-- `SYSTEM_PROMPT` — four lines telling the model it's inside ClawTrace. Tool enumeration happens via schemas, not the system prompt.
+- `_build_openai_messages(memory)` — internal: prepends `{"role": "system", "content": memory.system_prompt}` if non-empty, runs `messages_to_openai` on the result.
 
-Timing capture: `request_start` at the top of the call, `first_token_at` on the first delta with content or tool_calls, `request_end` after the stream ends. `ttft_ms = first_token_at - request_start`, `decode_time_ms = request_end - first_token_at`, `latency_ms = request_end - request_start`. `prefill_time_ms` is set equal to `ttft_ms` today — when we add a real prefill measurement (requires server-side data), that alignment can break.
+Timing capture: `request_start` at the top of the call, `first_token_at` on the first delta with content or tool_calls, `request_end` after the stream ends. `ttft_ms = first_token_at - request_start`, `decode_time_ms = request_end - first_token_at`, `latency_ms = request_end - request_start`. `prefill_time_ms` is set equal to `ttft_ms` today — when we add a real prefill measurement (requires server-side data), that alignment can break. The `SYSTEM_PROMPT` constant that used to live here was deleted; prompts.py owns prompt content now.
 
 Module-level state: `PROVIDERS` dict (openai, custom), `_PREFIXES` tuple for detection.
 
-### `tools.py` (440 lines)
+### `tools.py` (~440 lines)
 
 Tool registry + 6 tools: `bash`, `read_file`, `write_file`, `edit_file`, `glob`, `grep`. Every tool func has signature `func(params, config, context) -> str`; `context` is `RuntimeContext | None` and is unused by all tools except `spawn_subagent`.
 
@@ -116,7 +154,7 @@ Public surface:
 
 - `ToolDef` (dataclass, not frozen — allows runtime toggling of flags if ever needed): `(name, schema, func, read_only, concurrent_safe)`.
 - `register_tool(tool_def)`, `get_tool(name)`, `get_all_tools()`, `get_tool_schemas()`, `clear_registry()`.
-- `execute_tool(name, params, config=None, context=None) -> str` — registry dispatch with max-output truncation (`max_tool_output` = 32000 chars default; middle is elided with a `[... N chars truncated ...]` marker).
+- `execute_tool(name, params, config=None, context=None) -> str` — registry dispatch with max-output truncation (`max_tool_output` = 32000 chars default; middle is elided with a `[... N chars truncated ...]` marker). On a raised exception, returns `f"Error: executing {name}: {exc}"` — the leading `"Error:"` matches engine's `exit_status` classifier (B1 fix).
 
 Per-tool `concurrent_safe` values:
 
@@ -132,11 +170,11 @@ Per-tool `concurrent_safe` values:
 
 Module-level state: `_registry: dict[str, ToolDef]`. `_register_builtins()` runs once at import, populating the registry. Tests that load `tools.py` via `importlib.util.spec_from_file_location` get a fresh module instance with a fresh registry — be aware if you construct tests with `_load_module`.
 
-### `subagent.py` (127 lines)
+### `subagent.py` (~155 lines)
 
 Owns `AgentDefinition` (schema inspired by cheetahclaws' multi_agent layer) and `_spawn_subagent`. Exists **specifically to break the circular import** that would arise if `spawn_subagent` lived in `tools.py`: its func does `from engine import Episode, run_episode` **inside the function body**, not at module top. This is load-bearing — moving it to the top works *today* because engine doesn't import subagent, but makes the file fragile to future refactors.
 
-`runner.py` imports `subagent` (as `import subagent  # noqa: F401`) for the registration side-effect. Tests that don't exercise subagents skip this import; the tool simply isn't in the registry for those tests, which is fine.
+`runner.py` and `profile_swebench.py` both import `subagent` (as `import subagent  # noqa: F401`) for the registration side-effect. Tests that don't exercise subagents skip this import; the tool simply isn't in the registry for those tests, which is fine.
 
 `_spawn_subagent` order of operations:
 
@@ -146,11 +184,12 @@ Owns `AgentDefinition` (schema inspired by cheetahclaws' multi_agent layer) and 
 4. `budget.reserve(parent_episode_id, parent_depth)` → return error string if rejected
 5. Build `child_config` (copy of dict, apply `model` / `max_steps` overrides from params)
 6. Construct `child_episode` via `Episode.new_child(parent, parent_step_id=context.step_id)`
-7. Write `subagent_start` event to the **parent's** trace writer
-8. Call `run_episode(config=child_config, trace_path=child_trace_path, task_input=task, episode=child_episode, budget=budget)` — inside a `try/finally`
-9. `budget.release()` in `finally`
-10. Write `subagent_end` event to the parent's trace with `duration_ms` and child status
-11. Return `result["final_text"]` (or `"(subagent produced no final text)"` if empty)
+7. Compute `child_trace_path = output_dir / child_episode.root_episode_id / f"{child_episode.episode_id}.jsonl"` — root_episode_id is inherited from the parent, so children always land as siblings of the parent's trace.
+8. Write `subagent_start` event to the **parent's** trace writer
+9. Call `run_episode(config=child_config, trace_path=child_trace_path, task_input=task, episode=child_episode, budget=budget)` — inside a `try/finally`
+10. `budget.release()` in `finally`
+11. Write `subagent_end` event to the parent's trace with `duration_ms` and child status
+12. Return `result["final_text"]` (or `"(subagent produced no final text)"` if empty)
 
 ### `trace.py` (49 lines)
 
@@ -158,20 +197,63 @@ Minimal. `make_event(event_type, step_id=None, **fields)` is just a dict builder
 
 `TraceWriter`:
 
-- `__init__(path)` — creates parent dir, opens file in append mode (`"a"`), initializes `_lock = threading.Lock()`.
+- `__init__(path)` — creates parent dir (including the per-root-episode subdir), opens file in append mode (`"a"`), initializes `_lock = threading.Lock()`.
 - `write(event)` — acquires lock, `json.dump`, newline, `flush`. Lock guards the full write+newline+flush so concurrent events don't interleave mid-line.
 - `close()` — closes file handle if not already closed.
 - Supports context-manager protocol (`__enter__` / `__exit__` calls close).
 
 **The lock is load-bearing** for parallel execution. Removing it will cause interleaved JSONL garbage under `allow_parallel_tools=True`.
 
-### `config.py` (79 lines)
+### `config.py` (~62 lines)
 
-`DEFAULT_CONFIG` dict is the disk/boundary format (JSON-friendly). `RunConfig` frozen dataclass is the internal format. `RunConfig.from_dict(data)` filters unknown keys so old config files don't crash; it uses `dataclasses.fields(cls)` to compute the allowed set. `to_dict()` uses `dataclasses.asdict`. Every function inside `engine.py` works with `RunConfig`; `llm.py` and `tools.py` still take a dict (boundary).
+`RunConfig` (frozen dataclass) is the **single source of truth** for all 20 knobs and their defaults. `DEFAULT_CONFIG: dict[str, Any] = asdict(RunConfig())` derives the dict from it at module load — adding a knob is one dataclass field, the dict syncs automatically.
 
-`DEFAULT_CONFIG` and `RunConfig` must stay in sync on field names. Adding a knob means editing both.
+- `RunConfig.from_dict(data)` filters unknown keys via `dataclasses.fields(cls)` so old config files don't crash. `to_dict()` uses `asdict`.
+- `load_config(path=None)` returns a dict (defaults merged with any JSON file contents). `save_config(config, path)` writes pretty-printed JSON.
 
-`load_config(path=None)` returns a dict (defaults merged with any JSON file contents). `save_config(config, path)` writes pretty-printed JSON.
+The dict↔dataclass seam is the boundary: `engine.py` works with `RunConfig`; `llm.py`, `tools.py`, and the dispenser take dicts.
+
+### `swebench_dispenser.py` (~165 lines)
+
+The SWE-bench library — a pure-Python layer above the engine, no LLM imports.
+
+- `InstanceCharacteristics` (frozen dataclass) — `instance_id`, `repo`, `problem_statement_length`, `hints_present`, `num_fail_to_pass`, `num_pass_to_pass`, `base_commit`, `created_at`.
+- `Workload` (frozen dataclass) — `instance_id`, `repo_path`, `task_input`, `characteristics`, `raw_instance`.
+- `load_instances(jsonl_path)` — reads the SWE-bench JSONL, returns `list[dict]`.
+- `characterize(instance)` — converts one raw instance dict to `InstanceCharacteristics` (parses the JSON-encoded `FAIL_TO_PASS` / `PASS_TO_PASS` strings, treats blank `hints_text` as absent).
+- `select(instances, *, min_ps_len, max_ps_len, repo, instance_id, limit)` — filter helper.
+- `build_workload(instance, repos_dir)` — verifies the per-instance clone exists at `<repos_dir>/<instance_id>/` and that `base_commit` resolves in its history (`git cat-file -e <sha>^{commit}`); returns a `Workload`.
+- `reset_repo(repo_path, base_commit)` — `git reset --hard <base_commit> && git clean -fd`. Idempotent; defends against agent-staged or agent-committed state.
+- `capture_diff(repo_path, base_commit)` — stages everything (`git add -A`) then `git diff --cached <base_commit>` so untracked files are in the diff too. Cumulative against base, regardless of whether the agent committed mid-run.
+- `render_task(instance, repo_path)` — `problem_statement + repo pointer`. The "stop hint" was dropped; the `agent` system prompt covers termination.
+- `write_predictions(instance_id, model_patch, output_path)` — emits a SWE-bench-format predictions file the eval harness can consume later.
+
+### `profile_swebench.py` (~150 lines)
+
+The SWE-bench CLI driver. Iterates selected instances, runs each through `engine.run_episode` with `workload_info=asdict(characteristics)`, captures the diff and predictions next to the trace.
+
+- `_build_config(args)` — turns CLI args into a config dict (`--system-prompt`, `--output-dir`, `--config <json>`). Also pre-resolves `output_dir` to absolute against the script-start cwd, *before* the per-instance chdir loop. This is the B3 fix: without pre-resolution, traces would land inside the SWE-bench repo (and `capture_diff`'s `git add -A` would sweep them up).
+- `_run_one(instance, repos_dir, cfg_overrides, original_cwd)` — three-phase: setup (`build_workload` + `reset_repo`), run (`chdir` → `run_episode` → `chdir` back via `try/finally`), capture (`capture_diff` → write `.diff` and `.predictions.json` next to the trace). Returns `(success, summary_line)`. Setup failures return `status=skipped`; run failures return `status=crashed`; capture failures degrade to `warning=capture_failed:...` but still count as success.
+- `main()` — exits 0 if every instance succeeded, else 1.
+
+### `analyzer.py` (~310 lines)
+
+The trace analyzer. Single-file input; output is a per-episode summary plus (when applicable) a recursive subagent tree, full `cfg`, and `workload_info`.
+
+- `EpisodeSummary` (dataclass) — derived metrics: `total_wall_ms` (from episode_start/end timestamps), `total_llm_ms` (sum of `llm_call.latency_ms`), `total_tool_ms` (per-step `max(ended_at_ms) - min(started_at_ms)` summed — handles parallel correctly without over-counting), `prompt/completion_tokens_total`, `tool_call_count_by_name`, `subagent_count`, plus identity fields and the full `cfg` / `workload_info` from `episode_start`.
+- `summarize(rows)` — builds an `EpisodeSummary` from a parsed JSONL list. Raises on missing `episode_start` or `episode_end`.
+- `render_summary(summary)`, `render_workload(workload)`, `render_config(cfg)` — text renderers.
+- `TreeNode` + `build_tree(trace_path)` — recursively follows `subagent_end.child_trace_path`. Relative paths resolve via *basename* in the trace's parent dir (works for both the new per-root-episode layout and the legacy flat layout). Missing children render as `(MISSING: trace file not found)` rather than crashing.
+- `render_tree(node)` — indented ASCII tree with box-drawing connectors (`├─`, `└─`, `│  `, `   `). Each node line: `episode_id (depth N, spawned at step M, status, K steps)`.
+- `main(argv)` — single trace path arg. Prints summary → workload → config → tree. Auto-saves the same to `<trace_dir>/<trace_stem>.analysis.txt`.
+
+### `runner.py` (~55 lines)
+
+Plain CLI for one task → one episode. Loops `runs_per_task` times serially (per-run + aggregate wall time printed). The only opinion it imposes vs `DEFAULT_CONFIG` is `allow_parallel_tools=True` — kept as a runner-specific choice.
+
+### `run_swebench.sh` (project root, executable)
+
+End-to-end shell wrapper: dispense → profile → analyze each trace produced. Forwards filter / config args to `profile_swebench.py`. Captures dispenser stdout via `tee`, greps for `trace=<path>`, runs `analyzer.py` on each. Propagates the dispenser's exit code via `PIPESTATUS`.
 
 ## 3. Code Provenance
 
@@ -187,7 +269,7 @@ Crucial for future sessions: knowing what came from `cheetahclaws` vs. what's ou
 
 | Piece | Source | Our version | What changed |
 |---|---|---|---|
-| Tool impl `_read_file` | `cheetahclaws/tools.py::_read` (line 384) | `tools.py::_read_file` | Removed `newline=""` kwarg (Python 3.13+ only); same logic otherwise |
+| Tool impl `_read_file` | `cheetahclaws/tools.py::_read` | `tools.py::_read_file` | Removed `newline=""` kwarg (Python 3.13+ only); same logic otherwise |
 | Tool impl `_write_file` | `cheetahclaws/tools.py::_write` | `tools.py::_write_file` | Same kwarg removal; renamed to `_write_file` |
 | Tool impl `_edit_file` | `cheetahclaws/tools.py::_edit` | `tools.py::_edit_file` | Same kwarg removal; renamed |
 | Tool impl `_bash` | `cheetahclaws/tools.py::_bash` | `tools.py::_bash` | Identical |
@@ -200,8 +282,8 @@ Crucial for future sessions: knowing what came from `cheetahclaws` vs. what's ou
 | `tools_to_openai` schema converter | `cheetahclaws/providers.py::tools_to_openai` | `llm.py::tools_to_openai` | Identical logic |
 | `messages_to_openai` converter | `cheetahclaws/providers.py::messages_to_openai` | `llm.py::messages_to_openai` | Same shape; ours is simpler (only openai backend) |
 | Streamed tool-call reconstruction | `cheetahclaws/providers.py::stream_openai_compat` | `llm.py::run_assistant_turn` | Same pattern: buffer `tool_calls[index]` across chunks, assemble at end |
-| System prompt style | `cheetahclaws/agent.py` | `llm.py::SYSTEM_PROMPT` | Ours is intentionally shorter (4 lines) |
-| Neutral history format | `cheetahclaws/agent.py::AgentState.messages` | Engine's `history: list[dict]` | Same shape: user/assistant-with-tool_calls/tool roles |
+| `build_system_prompt` pattern | `cheetahclaws/context.py::build_system_prompt` | `prompts.py::build_system_prompt` | Same shape (template constant + `.format()` substitutions for env / git info, conditional appended sections). Our template body is ours; the assembly pattern is the lift. We added a registry of named presets and a raw-override path that bypasses formatting. |
+| Neutral message format | `cheetahclaws/agent.py::AgentState.messages` | `memory.py::Memory.messages` | Same shape: user / assistant-with-tool_calls / tool roles. Cheetahclaws keeps history on a global agent state; ours lives on a per-episode `Memory` dataclass owned by `run_episode`. |
 | `AgentDefinition` idea | `cheetahclaws/multi_agent/subagent.py::AgentDefinition` | `subagent.py::AgentDefinition` | Trimmed: `(name, description, system_prompt?, model?, max_steps?)` only. No `tools`, no `source` |
 
 ### Written from scratch
@@ -210,16 +292,22 @@ Crucial for future sessions: knowing what came from `cheetahclaws` vs. what's ou
 |---|---|
 | `engine.py` entire file | Our control layer. `run_episode`, `Episode`, `Reservation`, `SubagentBudget`, `RuntimeContext`, `ToolResult`, `ToolExecutor`, all helpers. |
 | `trace.py` entire file | Minimal JSONL writer. Thread-safe. No cheetahclaws equivalent. |
-| `config.py::RunConfig` dataclass | Our typed representation. `DEFAULT_CONFIG` dict fields partially overlap with cheetahclaws config but we diverge in naming and semantics (especially subagent knobs). |
+| `memory.py` entire file | Per-episode `Memory` dataclass. Pure state — no provider knowledge. Append helpers replace the old engine-level `_final_assistant_text` and inline dict appends. |
+| `prompts.py` template content | Template body, registry, and the parallel/subagent conditional blocks are ours. The `build_system_prompt(cfg, is_subagent)` pattern itself is the lift (above). |
+| `config.py::RunConfig` dataclass | Our typed representation. `DEFAULT_CONFIG` dict fields partially overlap with cheetahclaws config but we diverge in naming and semantics (especially subagent knobs). After consolidation, `DEFAULT_CONFIG = asdict(RunConfig())` — RunConfig is the single source of truth. |
 | `config.py::load_config` / `save_config` | Simple JSON file I/O. |
-| `runner.py` | Ours. ~28 lines. |
-| `subagent.py::_spawn_subagent` | Our design. Recursion + budget reserve/release + `subagent_start` / `subagent_end` events. Cheetahclaws' subagent uses a thread pool + queue; we don't. |
+| `runner.py` | Ours. ~55 lines. |
+| `subagent.py::_spawn_subagent` | Our design. Recursion + budget reserve/release + `subagent_start` / `subagent_end` events + per-root-episode `child_trace_path` computation. Cheetahclaws' subagent uses a thread pool + queue; we don't. |
 | `ToolExecutor` class | Our design. Single abstraction for serial + parallel tool dispatch, with Option A safety gate. |
 | `SubagentBudget` class | Our design. Four-cap budget with one reservation/release interface. |
 | `Episode` dataclass with parent linkage | Our design. |
 | `RuntimeContext` | Our design. Cheetahclaws has a `runtime.py` singleton which we explicitly chose not to use. |
 | Tool lambdas + registration order in `tools.py::_register_builtins` | Ours. Cheetahclaws registers tools differently (schema-first with TOOL_SCHEMAS list). |
-| Trace event types & field names | Ours. |
+| Trace event types & field names (incl. `episode_start` with full cfg + workload_info) | Ours. |
+| `swebench_dispenser.py` entire file | Our design (per `workload.md`). Per-instance dir convention, characterize / select / build / reset / capture / write_predictions. No cheetahclaws equivalent. |
+| `profile_swebench.py` entire file | Our SWE-bench CLI driver. Sets up `workload_info` for `run_episode`, manages `chdir` per instance, post-run capture. |
+| `analyzer.py` entire file | Our trace analyzer. Per-episode metrics with parallel-aware tool wall calc, recursive subagent tree across files, full cfg + workload dump, auto-saved `.analysis.txt`. |
+| `run_swebench.sh` | Our end-to-end wrapper at the project root. |
 
 ### Explicitly not lifted
 
@@ -428,11 +516,11 @@ Grouped by what they change:
 
 | Knob | Default | Effect |
 |---|---|---|
-| `enable_subagents` | `False` | Filter `spawn_subagent` out of LLM-visible schemas when disabled |
-| `max_subagents_total` | `0` | Lifetime cap across the whole root tree (`0` = unlimited) |
-| `max_subagents_per_parent` | `0` | Lifetime cap per individual parent (`0` = unlimited) |
-| `max_subagent_depth` | `0` | Nesting depth cap (`0` = unlimited) |
-| `max_concurrent_subagents` | `1` | How many may be in flight simultaneously |
+| `enable_subagents` | `True` | Filter `spawn_subagent` out of LLM-visible schemas when disabled |
+| `max_subagents_total` | `2` | Lifetime cap across the whole root tree (`0` = unlimited) |
+| `max_subagents_per_parent` | `2` | Lifetime cap per individual parent (`0` = unlimited) |
+| `max_subagent_depth` | `1` | Nesting depth cap (`0` = unlimited) |
+| `max_concurrent_subagents` | `2` | How many may be in flight simultaneously |
 | `subagent_parallelism` | `"serial"` | See D8 above |
 
 ### Runner
@@ -643,6 +731,11 @@ For subagents, the fake-turns list must cover parent turns **and** child turns (
 
 ### Recently shipped
 
+- **`analyzer.py`** — per-episode metrics (wall / llm / tool ms with parallel-aware tool wall calc, prompt+completion tokens, tool counts, subagent count), recursive subagent tree visualization (follows `subagent_end.child_trace_path` across files), full `cfg` + `workload_info` sections in the output. Auto-saves to `<trace_dir>/<trace_stem>.analysis.txt` next to the trace.
+- **Per-root-episode trace dir layout** — `traces/episode_<root_id>/` is now one folder per run, holding the root `.jsonl`, all subagent `.jsonl` siblings, and (when applicable) `.diff` / `.predictions.json` / `.analysis.txt`. Engine's `_resolve_trace_path` and `subagent.py`'s `child_trace_path` both build this path.
+- **`run_swebench.sh`** — end-to-end wrapper at the project root: dispense → profile → analyze each trace produced. Forwards filter / config args to `profile_swebench.py`.
+- **`config.py` consolidation** — `DEFAULT_CONFIG` now derived from `RunConfig` via `asdict(RunConfig())`. Adding a knob is one dataclass field; the dict syncs automatically. Eliminates the silent-drift footgun the doc previously warned about.
+- **Default values shifted toward "realistic agent"** — `enable_subagents=True`, subagent caps now `2/2/1/2` (per-parent / total / depth / concurrent) instead of unlimited / 1. `max_steps=20` (was `8`). `allow_parallel_tools` still defaults to `False`.
 - **`memory.py`** — `Memory` class owns conversational history and system prompt; engine uses append helpers instead of poking dicts directly. `messages_to_openai` stayed in `llm.py` (provider-format converter belongs with provider transport).
 - **`prompts.py`** — configurable system prompts with `"agent"` (multi-section template w/ env + git info + conditional parallel/subagent blocks) and `"minimal"` presets, raw-string overrides, `append_system_prompt`. Subagents always get `"minimal"` (hardcoded for now).
 - **`episode_start` trace event** — first event in every trace, carries `task_input`, `model`, `backend`, `system_prompt_name`, `system_prompt_chars`, full `cfg` snapshot, and `workload_info`. Subsumed the dispenser's planned `workload_info` event; `step_start` no longer duplicates `task_input`.
@@ -652,16 +745,14 @@ For subagents, the fake-turns list must cover parent turns **and** child turns (
 
 ### Up next, in approximate priority order
 
-1. **Trace analysis script** — *now the gating piece for everything else.* Summarize a JSONL file (totals, per-step stats, tool-mix, wall-time attribution). Across multiple runs from `runs_per_task` or across dispenser instances: mean/stddev of latency and token usage, grouped by `cfg.model`, `system_prompt_name`, `workload_info.repo`, etc. First derived metrics: `total_llm_time_ms`, `total_tool_time_ms`, `total_wall_time_ms`, `tool_call_count_by_name`, `steps_to_completion`. Without this, dispenser traces are write-only.
-2. **vLLM backend** — `vendor/providers.py` is waiting. Swap `llm.py` to use `providers.stream()`; gains ~10 backends including vLLM. Now genuinely valuable since the dispenser can drive many SWE-bench instances against a self-hosted model cheaply.
-3. **TBT (time-between-tokens)** — record per-chunk arrival timestamps in `llm.py`, add to `llm_call` events.
-4. **`history_policy`** — start with `"full"` (current) and `"snip_old_tool_results"` (lift from `cheetahclaws.compaction`). Memory class has the natural seam.
+1. **vLLM backend** — `vendor/providers.py` is waiting. Swap `llm.py` to use `providers.stream()`; gains ~10 backends including vLLM. Genuinely valuable now: dispenser can drive many SWE-bench instances against a self-hosted model cheaply, and analyzer can compare them.
+2. **`history_policy`** — start with `"full"` (current) and `"snip_old_tool_results"` (lift from `cheetahclaws.compaction`). Memory class has the natural seam. The first real SWE-bench run produced 169K input tokens across 20 steps before hitting `max_steps`; unbounded history is now an observed cost, not just a theoretical one.
+3. **Per-instance Python env setup for SWE-bench** — the astropy smoke run hit `max_steps_reached` partly because the agent kept trying to `bash` `pip install` / `python -c "import astropy"` and failing (the clawTrace venv has no per-instance deps). Either the dispenser pre-installs each instance's env, or we shell out to SWE-bench's harness Docker images. Without test feedback, agents edit blind. Higher leverage than (4) and (5) until fixed.
+4. **TBT (time-between-tokens)** — record per-chunk arrival timestamps in `llm.py`, add to `llm_call` events.
 5. **Non-serial `subagent_parallelism` modes** — `"shared+optimistic"` (~40 lines, mtime detection) and/or `"worktree"` (heavier).
-6. **Optional `--eval` for `profile_swebench.py`** — predictions files are already emitted; running them through `swebench.harness.run_evaluation` is ~50 lines + Docker setup. Only worth doing once trace analysis exists to correlate eval pass/fail with profiling metrics.
+6. **Optional `--eval` for `profile_swebench.py`** — predictions files are already emitted; running them through `swebench.harness.run_evaluation` is ~50 lines + Docker setup. Pairs naturally with (3) since both want the per-instance test environment.
+7. **Analyzer extensions (deferred from v1.5)** — `--group-by`, `--filter`, `--json` output, directory input. Add once you have a real comparison to run.
 
-### Stale doc warning
-
-§2 (Current Architecture) and §3 (Code Provenance) predate `memory.py`, `prompts.py`, `swebench_dispenser.py`, and `profile_swebench.py`. Module signatures (e.g. `run_assistant_turn` first arg, `run_episode` `workload_info` kwarg) and removed helpers (`_final_assistant_text`) are also out of date. A pass through §2/§3 is queued but not yet done.
 
 ## 16. How To Run
 
