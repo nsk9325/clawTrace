@@ -7,7 +7,7 @@ clawTrace is end-to-end agentic workload tracer including
 
 Given a workload manually or by the SWE-bench workload dispenser, it is handled by the agentic loop, then leaves a JSONL trace file with every LLM call, tool call, and subagent spawn timestamped and attributed. It can be analyzed manually or summarized by the analyzer.
 
-![Architecture](/clawTrace/img/Architecture.png)
+![Architecture](/img/Architecture.png)
 
 ## Install & Run
 
