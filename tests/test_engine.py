@@ -421,8 +421,6 @@ def test_subagent_budget_per_parent_cap():
 
 
 def test_spawn_subagent_end_to_end(tmp_path):
-    import subagent as _subagent_mod  # noqa: F401 — registers spawn_subagent
-
     trace_path = tmp_path / "parent.jsonl"
     turns = [
         llm.AssistantTurn(
@@ -480,10 +478,6 @@ def test_spawn_subagent_end_to_end(tmp_path):
 
 
 def test_spawn_subagent_disabled_returns_error_when_called(tmp_path):
-    import subagent as _subagent_mod  # noqa: F401
-    import config as config_mod
-
-    cfg = config_mod.RunConfig.from_dict(config_mod.DEFAULT_CONFIG)
     executor, writer = _build_executor(tmp_path, {"enable_subagents": False})
     try:
         result = executor._run_one(
@@ -555,8 +549,6 @@ def test_max_steps_reached_reports_incomplete_status(tmp_path):
 
 
 def test_subagent_crash_emits_subagent_end_with_error(tmp_path, monkeypatch):
-    import subagent as subagent_mod  # noqa: F401 — registers spawn_subagent
-
     trace_path = tmp_path / "parent_crash.jsonl"
     turns = [
         llm.AssistantTurn(

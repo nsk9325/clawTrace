@@ -1,37 +1,25 @@
 # ClawTrace
 
-A configurable wrapper with profiling around agentic LLM workloads. The primary artifact is the **trace** — a JSONL file per episode with every LLM call, tool call, and subagent spawn timestamped and attributed.
+clawTrace is end-to-end agentic workload tracer including
+- **A SWE-bench workload dispenser**
+- **A highly-configurable agentic wrapper**, leaving a JSONL trace file
+- **A Trace analyzer**, creating the main artifacts
 
-Not a chat product. Not a general-purpose agent runtime. A profiling harness.
+Given a workload manually or by the SWE-bench workload dispenser, it is handled by the agentic loop, then leaves a JSONL trace file with every LLM call, tool call, and subagent spawn timestamped and attributed. It can be analyzed manually or summarized by the analyzer.
 
-## Scope
-
-`cheetahclaws` is an assistant runtime. `clawTrace` is an execution-and-tracing framework. We **vendor** `cheetahclaws`' provider code for future vLLM support but reimplement the loop ourselves so the trace shape stays under our control.
-
-## Features
-
-- Bounded assistant-turn loop. `max_steps` is hard.
-- Native model tool-calling (OpenAI-compatible streaming today).
-- Per-step, per-tool timing: `latency_ms`, `ttft_ms`, `prefill_time_ms`, `decode_time_ms`, `started_at_ms` / `ended_at_ms` on every tool call.
-- **Optional parallel tool execution** — gated by a safety rule: enabled only when every tool in the batch is `concurrent_safe=True`. See [implement.md](implement.md#d6-parallel-tool-calls--option-a-vs-option-b-gate).
-- **Optional subagent spawning** — recursive, with four budget caps (total / per-parent / depth / concurrent) and a `subagent_parallelism` mode knob for write-conflict policy.
-- 6 built-in tools: `bash`, `read_file`, `write_file`, `edit_file`, `glob`, `grep`.
-- **Configurable system prompts** — registry-based (`"agent"` / `"minimal"`) or raw override, with config-aware sections that toggle on `allow_parallel_tools` / `enable_subagents`. Subagents always get the minimal prompt.
-- JSONL traces, one file per episode. Subagent episodes get their own file with parent linkage.
-- **Self-describing traces** — every trace's first event is `episode_start` with task input, model, system prompt name, full config snapshot, and (when driven by the dispenser) workload metadata.
-- **SWE-bench dispenser** — drive the agent against real bug-fix instances, capture trace + diff + predictions file per instance.
+![Architecture](/clawTrace/img/Architecture.png)
 
 ## Install & Run
 
+### Install & Export Token (OPENAI)
 ```bash
 cd clawTrace
 source .venv/bin/activate
 pip install -r requirements.txt
 export OPENAI_API_KEY=sk-...
-python runner.py "Read these three files and summarize each: README.md, implement.md, config.py"
 ```
 
-Drive against SWE-bench instances (end-to-end: dispense → profile → analyze):
+### Run SWE-bench instances (dispense → profile → analyze)
 
 ```bash
 # After downloading swebench_lite.jsonl and pre-cloning a repo to
@@ -39,52 +27,37 @@ Drive against SWE-bench instances (end-to-end: dispense → profile → analyze)
 ./run_swebench.sh --instance-id astropy__astropy-12907 --config '{"max_steps":20}'
 ```
 
-See [workload.md](workload.md) for the dispenser's design + setup guide.
+### Run manually
+```bash
+python runner.py "Read these three files and summarize each: README.md, implement.md, config.py"
+```
 
-Inspect a trace by hand or via the analyzer:
+### Run Analyzer manually
 
 ```bash
-ls -lt traces/                                    # one dir per root episode
 python analyzer.py traces/episode_<root_id>/episode_<root_id>.jsonl
 # Prints summary + workload + config + subagent tree, and saves the
 # same to traces/episode_<root_id>/episode_<root_id>.analysis.txt
 ```
 
-## Architecture
+## LLM Backend
 
-```text
-runner.py                  Plain CLI: one task → one episode
-profile_swebench.py        SWE-bench CLI: many instances → many episodes
-analyzer.py                Per-trace metrics + subagent tree → analysis.txt
-run_swebench.sh            End-to-end wrapper: dispense → profile → analyze
-  │
-  ├─▶ engine.py            run_episode loop, Episode, SubagentBudget,
-  │                          RuntimeContext, ToolExecutor
-  ├─▶ subagent.py          spawn_subagent tool (separate file to break
-  │                          circular import with engine.run_episode)
-  ├─▶ memory.py            Memory class (history list + system prompt)
-  ├─▶ prompts.py           build_system_prompt(cfg, is_subagent), preset
-  │                          registry, env / git substitutions
-  ├─▶ swebench_dispenser.py  Workload, characterize, select, reset_repo,
-  │                            capture_diff, write_predictions
-  ├─▶ config.py            RunConfig dataclass (DEFAULT_CONFIG derived)
-  ├─▶ llm.py               OpenAI streaming, run_assistant_turn(memory, ...)
-  ├─▶ tools.py             ToolDef registry + 6 built-ins
-  ├─▶ trace.py             TraceWriter (thread-safe), make_event
-  └─▶ vendor/
-        providers.py       cheetahclaws' multi-backend streaming,
-                             vendored but unused (reserved for vLLM)
-```
+- Most of the LLM backend is lifted from cheetahclaws.
+- currently supports OPENAI API
+- In future, will support local vLLM serving with richer profiling
 
-**Trace dir layout:** one folder per root episode. `traces/episode_<root_id>/` holds the root `.jsonl`, all subagent `.jsonl` siblings, and (when applicable) the dispenser's `.diff` / `.predictions.json` and analyzer's `.analysis.txt`.
+## TMIs
 
-One step = one assistant turn. One JSONL file per episode. Parallelism comes from a single `ThreadPoolExecutor` inside `ToolExecutor` — not a dedicated subagent pool.
+- Per-step, per-tool timing: `latency_ms`, `ttft_ms`, `prefill_time_ms`, `decode_time_ms`, `started_at_ms` / `ended_at_ms` on every tool call.
+- **Optional parallel tool execution** — gated by a safety rule: enabled only when every tool in the batch is `concurrent_safe=True`. 
+- **Optional subagent spawning** — recursive, with four budget caps (total / per-parent / depth / concurrent) and a `subagent_parallelism` mode knob for write-conflict policy.
+- 6 built-in tools: `bash`, `read_file`, `write_file`, `edit_file`, `glob`, `grep`.
+- **Configurable system prompts** — registry-based (`"agent"` / `"minimal"`) or raw override, with config-aware sections that toggle on `allow_parallel_tools` / `enable_subagents`. Subagents always get the minimal prompt.
+- JSONL traces, one file per episode. Subagent episodes get their own file with parent linkage.
+- **Self-describing traces** — every trace's first event is `episode_start` with task input, model, system prompt name, full config snapshot, and (when driven by the dispenser) workload metadata.
+- **SWE-bench dispenser** — drive the agent against real bug-fix instances, capture trace + diff + predictions file per instance.
 
-For the full architecture, decisions, and scaling discipline: **[implement.md](implement.md)**.
-
-## Config (20 knobs)
-
-Highlights — see [implement.md §7](implement.md#7-config-knobs-all-20) for the full list.
+## Main Configurations
 
 | Knob | Default | What it changes |
 |---|---|---|
@@ -100,49 +73,29 @@ Highlights — see [implement.md §7](implement.md#7-config-knobs-all-20) for th
 | `max_subagents_total` | `2` | Lifetime cap across the whole root tree (`0` = unlimited) |
 | `runs_per_task` | `1` | Repeated runs per task; runner loops serially for variance measurement |
 
-Rule: a new knob earns its place when it changes execution strategy, latency, cost, or trace shape. Convenience-only knobs are rejected.
+## Implementation Status
 
-## Tests
+What Currently Works
 
-```bash
-python -m pytest tests/
-```
-
-Live runs are tested manually with `runner.py`; offline tests use fake assistant turns.
-
-## Status
-
-Working:
-
-- OpenAI-compatible streamed assistant turns with finish_reason preserved
-- Native tool-calling reconstruction from streamed deltas
-- Bounded multi-step loop
 - Parallel tool execution (gated by all-concurrent-safe)
 - Subagents with 4-cap budget + `serial` / `shared` parallelism modes
-- Per-root-episode trace dir layout: parent + subagent traces + dispenser/analyzer artifacts as siblings in `traces/episode_<root_id>/`
-- Self-describing traces via `episode_start` (task, model, prompt name, cfg snapshot, workload metadata)
+- Per-root-episode trace dir layout: parent + subagent traces + dispenser/analyzer artifacts as siblings in `traces/episode_<root_id>/
 - Configurable system prompts with environment / git substitutions and config-aware sections
-- Repeated-run driver (`runs_per_task`) with per-run and aggregate wall-time reporting
 - SWE-bench workload dispenser + profile CLI; emits trace + diff + predictions file per instance
 - Trace analyzer (`analyzer.py`): per-episode metrics, recursive subagent tree, full cfg + workload dump, auto-saves `.analysis.txt`
 - End-to-end shell wrapper (`run_swebench.sh`): dispense → profile → analyze each trace
-- Single-source-of-truth config: `RunConfig` dataclass defines the schema; `DEFAULT_CONFIG` is derived
+- Single-source-of-truth config: `RunConfig` dataclass
 
-Not built yet (roadmap in [implement.md §15](implement.md#15-whats-next)):
+Not built yet
 
 - vLLM backend
 - `history_policy` / context compaction (real cost: 169K input tokens observed in one 20-step SWE-bench run)
 - Per-instance Python env setup for SWE-bench (agents currently can't run target-repo tests, so they edit without feedback)
-- TBT metric
+- TBT metric (maybe needs a vLLM backend)
 - `subagent_parallelism="worktree"` and `"shared+optimistic"` modes
 - `--eval` flag for `profile_swebench.py` (predictions are emitted; harness call + Docker is the missing part)
-- Analyzer extensions: `--group-by`, `--filter`, `--json`, directory input
 
 ## What It Differs From
 
 - **`cheetahclaws`**: we borrow the core loop shape and tool registry but skip bridges, permissions, plan mode, checkpointing, UI, MCP, memory, multi-agent manager, compaction. Traces are the goal, not a chat product.
 - **Claude Code**: same general mechanism (native tool-calling, per-episode trace file, subagent-as-tool). Different concurrency model (sync + threads vs. async). No permission layer. No streaming UI.
-
-## License
-
-Same as the parent repository.

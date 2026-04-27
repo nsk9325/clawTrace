@@ -2,27 +2,8 @@ from __future__ import annotations
 
 import json
 import threading
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-
-
-def utc_timestamp() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def make_event(
-    event_type: str,
-    step_id: int | None = None,
-    **fields: Any,
-) -> dict[str, Any]:
-    event = {
-        "timestamp": utc_timestamp(),
-        "type": event_type,
-        "step_id": step_id,
-    }
-    event.update(fields)
-    return event
 
 
 class TraceWriter:

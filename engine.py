@@ -8,12 +8,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import events
+import subagent
 from config import RunConfig, load_config
 from llm import AssistantTurn, run_assistant_turn
 from memory import Memory
 from prompts import REGISTRY as PROMPT_REGISTRY, build_system_prompt
 from tools import execute_tool, get_tool, get_tool_schemas
-from trace import TraceWriter, make_event
+from trace import TraceWriter
 
 
 SUPPORTED_SUBAGENT_PARALLELISM = {"serial", "shared"}
@@ -147,17 +149,14 @@ class ToolExecutor:
         if not self.cfg.allow_parallel_tools or len(tool_calls) < 2:
             return False
         for tool_call in tool_calls:
+            if tool_call["name"] == subagent.SUBAGENT_TOOL_NAME:
+                if self.cfg.subagent_parallelism == "serial":
+                    return False
+                continue
             tool_def = get_tool(tool_call["name"])
-            if tool_def is None:
-                return False
-            if not self._tool_is_concurrent_safe(tool_def):
+            if tool_def is None or not tool_def.concurrent_safe:
                 return False
         return True
-
-    def _tool_is_concurrent_safe(self, tool_def) -> bool:
-        if tool_def.name == "spawn_subagent":
-            return self.cfg.subagent_parallelism != "serial"
-        return tool_def.concurrent_safe
 
     def _execute_serial(
         self,
@@ -195,9 +194,13 @@ class ToolExecutor:
             tool_call_id=tool_call["id"],
             cfg=self.cfg,
         )
+        is_subagent_call = tool_call["name"] == subagent.SUBAGENT_TOOL_NAME
 
         started = time.perf_counter()
-        output = execute_tool(tool_call["name"], tool_call["input"], self._cfg_dict, context)
+        if is_subagent_call:
+            output = subagent.spawn(tool_call["input"], self._cfg_dict, context, origin=origin)
+        else:
+            output = execute_tool(tool_call["name"], tool_call["input"], self._cfg_dict, context)
         ended = time.perf_counter()
 
         started_at_ms = int((started - origin) * 1000)
@@ -205,21 +208,24 @@ class ToolExecutor:
         latency_ms = ended_at_ms - started_at_ms
         exit_status = "error" if output.startswith("Error:") else "ok"
 
-        self.writer.write(
-            make_event(
-                "tool_call",
-                step_id=step_id,
-                **self.episode.to_event_fields(),
-                tool_call_id=tool_call["id"],
-                tool_name=tool_call["name"],
-                params=tool_call["input"],
-                started_at_ms=started_at_ms,
-                ended_at_ms=ended_at_ms,
-                latency_ms=latency_ms,
-                exit_status=exit_status,
-                result_preview=_text_preview(output),
+        # Subagent dispatch is recorded by subagent_start/subagent_end (emitted
+        # inside subagent.spawn). No tool_call event for it — subagents aren't
+        # tools.
+        if not is_subagent_call:
+            self.writer.write(
+                events.tool_call(
+                    self.episode,
+                    step_id=step_id,
+                    tool_call_id=tool_call["id"],
+                    tool_name=tool_call["name"],
+                    params=tool_call["input"],
+                    started_at_ms=started_at_ms,
+                    ended_at_ms=ended_at_ms,
+                    latency_ms=latency_ms,
+                    exit_status=exit_status,
+                    result_preview=_text_preview(output),
+                )
             )
-        )
 
         return ToolResult(
             tool_call_id=tool_call["id"],
@@ -264,10 +270,11 @@ def _validate_subagent_parallelism(cfg: RunConfig) -> None:
         raise ValueError(f"Unknown subagent_parallelism: '{mode}'")
 
 
-def _filter_schemas(schemas: list[dict[str, Any]], cfg: RunConfig) -> list[dict[str, Any]]:
+def _resolve_tool_schemas(cfg: RunConfig) -> list[dict[str, Any]]:
+    schemas = list(get_tool_schemas())
     if cfg.enable_subagents:
-        return schemas
-    return [s for s in schemas if s["name"] != "spawn_subagent"]
+        schemas.append(subagent.SUBAGENT_SCHEMA)
+    return schemas
 
 
 def run_episode(
@@ -302,14 +309,12 @@ def run_episode(
     )
     completed_steps = 0
     final_stop_reason = "max_steps_reached"
-    tool_schemas = _filter_schemas(get_tool_schemas(), cfg)
+    tool_schemas = _resolve_tool_schemas(cfg)
 
     with TraceWriter(trace_path) as writer:
         writer.write(
-            make_event(
-                "episode_start",
-                step_id=None,
-                **episode.to_event_fields(),
+            events.episode_start(
+                episode,
                 task_input=task,
                 model=cfg.model,
                 backend=cfg.backend,
@@ -322,10 +327,8 @@ def run_episode(
 
         if episode.depth == 0 and cfg.subagent_parallelism != "serial":
             writer.write(
-                make_event(
-                    "config_warning",
-                    step_id=None,
-                    **episode.to_event_fields(),
+                events.config_warning(
+                    episode,
                     field="subagent_parallelism",
                     value=cfg.subagent_parallelism,
                     note="parallel subagents share cwd; writes may race",
@@ -335,22 +338,14 @@ def run_episode(
         executor = ToolExecutor(cfg, writer, episode, budget)
 
         for step_id in range(cfg.max_steps):
-            writer.write(
-                make_event(
-                    "step_start",
-                    step_id=step_id,
-                    **episode.to_event_fields(),
-                    history_length=len(memory),
-                )
-            )
+            writer.write(events.step_start(episode, step_id=step_id, history_length=len(memory)))
 
             assistant_turn: AssistantTurn = run_assistant_turn(memory, tool_schemas, cfg_dict)
 
             writer.write(
-                make_event(
-                    "llm_call",
+                events.llm_call(
+                    episode,
                     step_id=step_id,
-                    **episode.to_event_fields(),
                     backend=cfg.backend,
                     model=cfg.model,
                     latency_ms=assistant_turn.latency_ms,
@@ -375,10 +370,9 @@ def run_episode(
             stop_reason = "no_tool_calls" if not assistant_turn.tool_calls else None
 
             writer.write(
-                make_event(
-                    "context_update",
+                events.context_update(
+                    episode,
                     step_id=step_id,
-                    **episode.to_event_fields(),
                     history_length=len(memory),
                     tool_call_count=len(assistant_turn.tool_calls),
                     executed_tool_call_count=len(tool_results),
@@ -386,10 +380,9 @@ def run_episode(
             )
 
             writer.write(
-                make_event(
-                    "step_end",
+                events.step_end(
+                    episode,
                     step_id=step_id,
-                    **episode.to_event_fields(),
                     action_type="assistant_turn",
                     tool_call_count=len(assistant_turn.tool_calls),
                     executed_tool_call_count=len(tool_results),
@@ -405,10 +398,8 @@ def run_episode(
         final_status = "completed" if final_stop_reason == "no_tool_calls" else "incomplete"
 
         writer.write(
-            make_event(
-                "episode_end",
-                step_id=None,
-                **episode.to_event_fields(),
+            events.episode_end(
+                episode,
                 status=final_status,
                 stop_reason=final_stop_reason,
                 step_count=completed_steps,

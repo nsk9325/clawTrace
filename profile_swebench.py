@@ -15,7 +15,6 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-import subagent  # noqa: F401  (registers spawn_subagent)
 from engine import run_episode
 from swebench_dispenser import (
     build_workload,

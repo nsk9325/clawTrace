@@ -5,4 +5,4 @@ traces/
 # *.jsonl
 swebench-repos/
 traces-smoke-broken/
-workload.md
+context.md

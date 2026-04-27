@@ -6,7 +6,6 @@ from typing import Any
 
 from config import load_config
 from engine import run_episode
-import subagent  # noqa: F401  (registers spawn_subagent)
 
 
 def _run_all(task_input: str, config: dict[str, Any]) -> list[tuple[dict[str, Any], int]]:

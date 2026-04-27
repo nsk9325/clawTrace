@@ -1,25 +1,24 @@
+"""Subagent dispatch — recursive episodes spawned mid-turn.
+
+Subagents are not tools. The LLM sees ``SUBAGENT_SCHEMA`` in its tool list
+(when ``enable_subagents`` is set) and calls it like a tool, but the engine
+routes the call to ``spawn(...)`` here instead of the tool registry. This
+keeps the tool layer (``tools.py``) free of the engine-recursion concern
+and lets subagents own their concurrency policy via ``subagent_parallelism``.
+"""
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from tools import ToolDef, register_tool
-from trace import make_event
+import events
 
 
-@dataclass(frozen=True)
-class AgentDefinition:
-    name: str
-    description: str
-    system_prompt: str | None = None
-    model: str | None = None
-    max_steps: int | None = None
+SUBAGENT_TOOL_NAME = "spawn_subagent"
 
-
-_SPAWN_SCHEMA = {
-    "name": "spawn_subagent",
+SUBAGENT_SCHEMA: dict[str, Any] = {
+    "name": SUBAGENT_TOOL_NAME,
     "description": (
         "Spawn a subagent to work on a sub-task. Returns the subagent's final text "
         "when it completes. Use for independent sub-tasks that can stand alone."
@@ -29,7 +28,6 @@ _SPAWN_SCHEMA = {
         "properties": {
             "task": {"type": "string", "description": "The task for the subagent"},
             "description": {"type": "string", "description": "Optional short description"},
-            "system_prompt": {"type": "string", "description": "Override system prompt"},
             "model": {"type": "string", "description": "Override model"},
             "max_steps": {"type": "integer", "description": "Override max steps"},
         },
@@ -38,7 +36,15 @@ _SPAWN_SCHEMA = {
 }
 
 
-def _spawn_subagent(params: dict[str, Any], config: dict[str, Any], context: Any) -> str:
+def spawn(
+    params: dict[str, Any],
+    config: dict[str, Any],
+    context: Any,
+    origin: float,
+) -> str:
+    """Dispatch a subagent call. ``origin`` is the step's perf_counter origin
+    so subagent_end can carry step-relative timing comparable to tool_call
+    events (used by the analyzer for parallel-aware wall computation)."""
     from engine import Episode, run_episode
 
     if context is None:
@@ -70,10 +76,9 @@ def _spawn_subagent(params: dict[str, Any], config: dict[str, Any], context: Any
     )
 
     context.writer.write(
-        make_event(
-            "subagent_start",
+        events.subagent_start(
+            parent_episode,
             step_id=context.step_id,
-            **parent_episode.to_event_fields(),
             tool_call_id=context.tool_call_id,
             child_episode_id=child_episode.episode_id,
             child_run_id=child_episode.run_id,
@@ -99,14 +104,16 @@ def _spawn_subagent(params: dict[str, Any], config: dict[str, Any], context: Any
     finally:
         budget.release()
 
-    duration_ms = int((time.perf_counter() - started) * 1000)
+    ended = time.perf_counter()
+    started_at_ms = int((started - origin) * 1000)
+    ended_at_ms = int((ended - origin) * 1000)
+    duration_ms = ended_at_ms - started_at_ms
 
     if result is not None:
         context.writer.write(
-            make_event(
-                "subagent_end",
+            events.subagent_end(
+                parent_episode,
                 step_id=context.step_id,
-                **parent_episode.to_event_fields(),
                 tool_call_id=context.tool_call_id,
                 child_episode_id=result["episode_id"],
                 child_run_id=result["run_id"],
@@ -114,16 +121,17 @@ def _spawn_subagent(params: dict[str, Any], config: dict[str, Any], context: Any
                 child_status=result["status"],
                 child_stop_reason=result["stop_reason"],
                 child_step_count=result["step_count"],
+                started_at_ms=started_at_ms,
+                ended_at_ms=ended_at_ms,
                 duration_ms=duration_ms,
             )
         )
         return result["final_text"] or "(subagent produced no final text)"
 
     context.writer.write(
-        make_event(
-            "subagent_end",
+        events.subagent_end(
+            parent_episode,
             step_id=context.step_id,
-            **parent_episode.to_event_fields(),
             tool_call_id=context.tool_call_id,
             child_episode_id=child_episode.episode_id,
             child_run_id=child_episode.run_id,
@@ -131,23 +139,10 @@ def _spawn_subagent(params: dict[str, Any], config: dict[str, Any], context: Any
             child_status="crashed",
             child_stop_reason="exception",
             child_step_count=0,
+            started_at_ms=started_at_ms,
+            ended_at_ms=ended_at_ms,
             duration_ms=duration_ms,
             error=error,
         )
     )
     return f"Error: subagent crashed — {error}"
-
-
-def _register_subagent_tool() -> None:
-    register_tool(
-        ToolDef(
-            name="spawn_subagent",
-            schema=_SPAWN_SCHEMA,
-            func=_spawn_subagent,
-            read_only=False,
-            concurrent_safe=False,
-        )
-    )
-
-
-_register_subagent_tool()
