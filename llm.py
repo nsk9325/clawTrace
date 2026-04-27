@@ -39,10 +39,10 @@ class AssistantTurn:
     output_tokens: int
     latency_ms: int
     ttft_ms: int | None
-    prefill_time_ms: int | None
     decode_time_ms: int | None
     measurement: str
     finish_reason: str | None = None
+    cached_tokens: int | None = None
 
 
 def detect_provider(model: str) -> str:
@@ -199,6 +199,7 @@ def run_assistant_turn(
     tool_buf: dict[int, dict[str, Any]] = {}
     prompt_tokens = 0
     completion_tokens = 0
+    cached_tokens: int | None = None
     finish_reason: str | None = None
 
     request_start = time.perf_counter()
@@ -209,6 +210,14 @@ def run_assistant_turn(
         if hasattr(chunk, "usage") and chunk.usage:
             prompt_tokens = getattr(chunk.usage, "prompt_tokens", 0) or prompt_tokens
             completion_tokens = getattr(chunk.usage, "completion_tokens", 0) or completion_tokens
+            details = getattr(chunk.usage, "prompt_tokens_details", None)
+            if details is not None:
+                # OpenAI exposes prefix-cache hit count here. Older API
+                # versions and some non-OpenAI providers omit this — leave
+                # cached_tokens as None when unmeasured.
+                cached = getattr(details, "cached_tokens", None)
+                if cached is not None:
+                    cached_tokens = int(cached)
 
         if not chunk.choices:
             continue
@@ -264,8 +273,8 @@ def run_assistant_turn(
         output_tokens=completion_tokens,
         latency_ms=int((request_end - request_start) * 1000),
         ttft_ms=ttft_ms,
-        prefill_time_ms=ttft_ms,
         decode_time_ms=decode_time_ms,
         measurement="client_streaming",
         finish_reason=finish_reason,
+        cached_tokens=cached_tokens,
     )

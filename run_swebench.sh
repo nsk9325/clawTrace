@@ -33,6 +33,8 @@ grep -oE 'trace=[^ ]+' "$output_file" \
             echo
             echo "==> Analyzing $trace"
             python analyzer.py "$trace"
+            echo "==> Generating token trace for $trace"
+            python token_trace_gen.py "$trace"
         fi
     done
 

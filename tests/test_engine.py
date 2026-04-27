@@ -86,13 +86,13 @@ def test_parallel_tools_overlap_in_time(tmp_path):
                 {"id": "call_2", "name": "read_file", "input": {"file_path": "b"}},
             ],
             input_tokens=1, output_tokens=1, latency_ms=1,
-            ttft_ms=0, prefill_time_ms=0, decode_time_ms=1,
+            ttft_ms=0, decode_time_ms=1,
             measurement="client_streaming",
         ),
         llm.AssistantTurn(
             text="done", tool_calls=[],
             input_tokens=1, output_tokens=1, latency_ms=1,
-            ttft_ms=0, prefill_time_ms=0, decode_time_ms=1,
+            ttft_ms=0, decode_time_ms=1,
             measurement="client_streaming",
         ),
     ]
@@ -147,7 +147,6 @@ def test_run_episode_creates_trace_file(tmp_path):
             output_tokens=5,
             latency_ms=12,
             ttft_ms=3,
-            prefill_time_ms=3,
             decode_time_ms=9,
             measurement="client_streaming",
         ),
@@ -158,7 +157,6 @@ def test_run_episode_creates_trace_file(tmp_path):
             output_tokens=4,
             latency_ms=10,
             ttft_ms=2,
-            prefill_time_ms=2,
             decode_time_ms=8,
             measurement="client_streaming",
         ),
@@ -188,7 +186,6 @@ def test_run_episode_writes_multi_step_events(tmp_path):
             output_tokens=5,
             latency_ms=12,
             ttft_ms=3,
-            prefill_time_ms=3,
             decode_time_ms=9,
             measurement="client_streaming",
         ),
@@ -199,7 +196,6 @@ def test_run_episode_writes_multi_step_events(tmp_path):
             output_tokens=4,
             latency_ms=10,
             ttft_ms=2,
-            prefill_time_ms=2,
             decode_time_ms=8,
             measurement="client_streaming",
         ),
@@ -245,7 +241,6 @@ def test_run_episode_tracks_history_and_task_input(tmp_path):
             output_tokens=5,
             latency_ms=12,
             ttft_ms=3,
-            prefill_time_ms=3,
             decode_time_ms=9,
             measurement="client_streaming",
         ),
@@ -276,7 +271,6 @@ def test_tool_call_event_has_timing_offsets(tmp_path):
             output_tokens=1,
             latency_ms=1,
             ttft_ms=0,
-            prefill_time_ms=0,
             decode_time_ms=1,
             measurement="client_streaming",
         ),
@@ -287,7 +281,6 @@ def test_tool_call_event_has_timing_offsets(tmp_path):
             output_tokens=1,
             latency_ms=1,
             ttft_ms=0,
-            prefill_time_ms=0,
             decode_time_ms=1,
             measurement="client_streaming",
         ),
@@ -319,7 +312,6 @@ def test_run_episode_ignores_finish_reason_for_loop_control(tmp_path):
             output_tokens=5,
             latency_ms=12,
             ttft_ms=3,
-            prefill_time_ms=3,
             decode_time_ms=9,
             measurement="client_streaming",
             finish_reason="stop",
@@ -331,7 +323,6 @@ def test_run_episode_ignores_finish_reason_for_loop_control(tmp_path):
             output_tokens=4,
             latency_ms=10,
             ttft_ms=2,
-            prefill_time_ms=2,
             decode_time_ms=8,
             measurement="client_streaming",
         ),
@@ -430,19 +421,19 @@ def test_spawn_subagent_end_to_end(tmp_path):
                 "input": {"task": "do the subtask"},
             }],
             input_tokens=1, output_tokens=1, latency_ms=1,
-            ttft_ms=0, prefill_time_ms=0, decode_time_ms=1,
+            ttft_ms=0, decode_time_ms=1,
             measurement="client_streaming",
         ),
         llm.AssistantTurn(
             text="child finished the subtask", tool_calls=[],
             input_tokens=1, output_tokens=1, latency_ms=1,
-            ttft_ms=0, prefill_time_ms=0, decode_time_ms=1,
+            ttft_ms=0, decode_time_ms=1,
             measurement="client_streaming",
         ),
         llm.AssistantTurn(
             text="parent done", tool_calls=[],
             input_tokens=1, output_tokens=1, latency_ms=1,
-            ttft_ms=0, prefill_time_ms=0, decode_time_ms=1,
+            ttft_ms=0, decode_time_ms=1,
             measurement="client_streaming",
         ),
     ]
@@ -498,7 +489,7 @@ def test_runs_per_task_produces_distinct_episodes(tmp_path):
         llm.AssistantTurn(
             text=f"done {i}", tool_calls=[],
             input_tokens=1, output_tokens=1, latency_ms=1,
-            ttft_ms=0, prefill_time_ms=0, decode_time_ms=1,
+            ttft_ms=0, decode_time_ms=1,
             measurement="client_streaming",
         )
         for i in range(3)
@@ -526,7 +517,7 @@ def test_max_steps_reached_reports_incomplete_status(tmp_path):
             text="",
             tool_calls=[{"id": f"c{i}", "name": "read_file", "input": {"file_path": "x"}}],
             input_tokens=1, output_tokens=1, latency_ms=1,
-            ttft_ms=0, prefill_time_ms=0, decode_time_ms=1,
+            ttft_ms=0, decode_time_ms=1,
             measurement="client_streaming",
         )
         for i in range(5)
@@ -558,13 +549,13 @@ def test_subagent_crash_emits_subagent_end_with_error(tmp_path, monkeypatch):
                 "input": {"task": "do it"},
             }],
             input_tokens=1, output_tokens=1, latency_ms=1,
-            ttft_ms=0, prefill_time_ms=0, decode_time_ms=1,
+            ttft_ms=0, decode_time_ms=1,
             measurement="client_streaming",
         ),
         llm.AssistantTurn(
             text="parent done after crash", tool_calls=[],
             input_tokens=1, output_tokens=1, latency_ms=1,
-            ttft_ms=0, prefill_time_ms=0, decode_time_ms=1,
+            ttft_ms=0, decode_time_ms=1,
             measurement="client_streaming",
         ),
     ]
@@ -604,7 +595,7 @@ def test_episode_start_is_first_and_carries_cfg(tmp_path):
         llm.AssistantTurn(
             text="done", tool_calls=[],
             input_tokens=1, output_tokens=1, latency_ms=1,
-            ttft_ms=0, prefill_time_ms=0, decode_time_ms=1,
+            ttft_ms=0, decode_time_ms=1,
             measurement="client_streaming",
         ),
     ]
@@ -633,7 +624,7 @@ def test_episode_start_marks_custom_system_prompt(tmp_path):
         llm.AssistantTurn(
             text="done", tool_calls=[],
             input_tokens=1, output_tokens=1, latency_ms=1,
-            ttft_ms=0, prefill_time_ms=0, decode_time_ms=1,
+            ttft_ms=0, decode_time_ms=1,
             measurement="client_streaming",
         ),
     ]
@@ -657,7 +648,7 @@ def test_episode_start_workload_info_passes_through(tmp_path):
         llm.AssistantTurn(
             text="done", tool_calls=[],
             input_tokens=1, output_tokens=1, latency_ms=1,
-            ttft_ms=0, prefill_time_ms=0, decode_time_ms=1,
+            ttft_ms=0, decode_time_ms=1,
             measurement="client_streaming",
         ),
     ]
@@ -682,7 +673,7 @@ def test_step_start_no_longer_duplicates_task_input(tmp_path):
         llm.AssistantTurn(
             text="done", tool_calls=[],
             input_tokens=1, output_tokens=1, latency_ms=1,
-            ttft_ms=0, prefill_time_ms=0, decode_time_ms=1,
+            ttft_ms=0, decode_time_ms=1,
             measurement="client_streaming",
         ),
     ]
