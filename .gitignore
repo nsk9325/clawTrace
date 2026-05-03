@@ -6,3 +6,5 @@ traces/
 swebench-repos/
 traces-smoke-broken/
 context.md
+vllm.md
+sb-cli-reports/
