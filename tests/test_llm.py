@@ -18,9 +18,14 @@ memory_mod = _load_module("memory", "memory.py")
 llm = _load_module("llm", "llm.py")
 
 
-def test_detect_provider_uses_prefix_and_explicit_provider():
+def test_detect_provider_uses_prefix_only():
+    # Known OpenAI prefixes auto-detect.
     assert llm.detect_provider("gpt-4o-mini") == "openai"
-    assert llm.detect_provider("custom/my-model") == "custom"
+    assert llm.detect_provider("o1-preview") == "openai"
+    # The slash carries no routing meaning. HF-style ids fall through to the
+    # default; users set backend="custom" explicitly for non-OpenAI providers.
+    assert llm.detect_provider("Qwen/Qwen2.5-7B-Instruct") == "openai"
+    assert llm.detect_provider("meta-llama/Llama-3.1-8B-Instruct") == "openai"
 
 
 def test_messages_to_openai_keeps_text_roles():
@@ -72,7 +77,7 @@ def test_openai_message_builder_uses_task_input():
 
 
 def main() -> None:
-    test_detect_provider_uses_prefix_and_explicit_provider()
+    test_detect_provider_uses_prefix_only()
     test_messages_to_openai_keeps_text_roles()
     test_openai_message_builder_uses_task_input()
     print("All llm tests passed.")

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import argparse
+import json
 import sys
 import time
 from typing import Any
@@ -22,15 +24,29 @@ def _run_all(task_input: str, config: dict[str, Any]) -> list[tuple[dict[str, An
     return out
 
 
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Run one ClawTrace episode against the agent loop.")
+    p.add_argument("task", nargs="+", help="The task input to send to the agent.")
+    p.add_argument(
+        "--config",
+        default=None,
+        help='Arbitrary cfg overrides as JSON, e.g. \'{"backend":"custom","custom_base_url":"http://localhost:8000/v1"}\'',
+    )
+    return p.parse_args(argv)
+
+
 def main() -> None:
-    task_input = " ".join(sys.argv[1:]).strip()
+    args = _parse_args()
+    task_input = " ".join(args.task).strip()
     # Only override defaults that the CLI is opinionated about.
     # `enable_subagents` and `max_parallel_tools` were redundant after
     # DEFAULT_CONFIG was tuned; `allow_parallel_tools=True` is kept here as
     # a runner-specific opinion (DEFAULT_CONFIG leaves it False).
-    config = {
+    config: dict[str, Any] = {
         "allow_parallel_tools": True,
     }
+    if args.config is not None:
+        config.update(json.loads(args.config))
 
     total_start = time.perf_counter()
     try:

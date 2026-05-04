@@ -46,16 +46,10 @@ class AssistantTurn:
 
 
 def detect_provider(model: str) -> str:
-    if "/" in model:
-        return model.split("/", 1)[0]
     for prefix, provider_name in _PREFIXES:
         if model.lower().startswith(prefix):
             return provider_name
     return "openai"
-
-
-def bare_model(model: str) -> str:
-    return model.split("/", 1)[1] if "/" in model else model
 
 
 def get_api_key(provider_name: str, config: dict[str, Any]) -> str:
@@ -173,7 +167,7 @@ def run_assistant_turn(
     messages = _build_openai_messages(memory)
 
     kwargs: dict[str, Any] = {
-        "model": bare_model(model),
+        "model": model,
         "messages": messages,
         "stream": True,
         "stream_options": {"include_usage": True},

@@ -17,6 +17,9 @@ class RunConfig:
     tool_timeout_s: int = 30
     output_dir: str = "traces"
     openai_base_url: str = ""
+    custom_base_url: str = ""
+    custom_api_key: str = ""
+    vllm_metrics_url: str = ""
     allow_parallel_tools: bool = False
     max_parallel_tools: int = 4
     enable_subagents: bool = True
