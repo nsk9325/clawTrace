@@ -107,10 +107,6 @@ is a literal HF model id, not a `provider/model` shortcut. Without
 - `pkill -f "vllm serve"` will kill the container's PID 1 if vLLM is
   launched via docker-init; the container restarts. To stop just the
   Python worker, use `pkill -f "python.*vllm"` instead.
-- WSL2 clients can occasionally show `latency_ms` on `llm_call` events
-  drift from wall-clock between event timestamps (`time.perf_counter` and
-  `datetime.now()` desync briefly). Native Linux clients (RunPod ssh, lab
-  box) are unaffected.
 
 ### Pass configs at runtime
 

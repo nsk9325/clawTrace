@@ -24,7 +24,8 @@ analyzer = _load_module("analyzer", "analyzer.py")
 
 def _episode_start(episode_id="ep_a", **overrides):
     base = {
-        "timestamp": "2026-04-26T10:00:00.000000+00:00",
+        "t_ms": 0,
+        "wall_clock_start": "2026-04-26T10:00:00.000000+00:00",
         "type": "episode_start",
         "step_id": None,
         "episode_id": episode_id,
@@ -48,7 +49,7 @@ def _episode_start(episode_id="ep_a", **overrides):
 
 def _episode_end(episode_id="ep_a", **overrides):
     base = {
-        "timestamp": "2026-04-26T10:00:05.000000+00:00",
+        "t_ms": 5000,
         "type": "episode_end",
         "step_id": None,
         "episode_id": episode_id,
@@ -103,6 +104,20 @@ def test_summarize_minimal_trace():
     assert s.completion_tokens_total == 10
     assert s.tool_call_count_by_name == {}
     assert s.subagent_count == 0
+
+
+def test_summarize_falls_back_to_iso_timestamps_for_legacy_traces():
+    """Pre-t_ms traces have only ``timestamp`` (ISO). The analyzer's
+    ``_episode_wall_ms`` helper must still compute wall time from those."""
+    start = _episode_start()
+    end = _episode_end()
+    # Strip the new fields, leave only the legacy ISO timestamps.
+    start.pop("t_ms")
+    start["timestamp"] = start.pop("wall_clock_start")
+    end.pop("t_ms")
+    end["timestamp"] = "2026-04-26T10:00:05.000000+00:00"
+    s = analyzer.summarize([start, _llm_call(latency_ms=200), end])
+    assert s.total_wall_ms == 5000
 
 
 def test_summarize_serial_tools_sum_to_wall_time():

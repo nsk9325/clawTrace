@@ -7,7 +7,10 @@ and adding or renaming a field is a single edit at one call site.
 
 Common fields on every event (set by ``_base``):
   - type:        event-type tag, e.g. "episode_start", "tool_call"
-  - timestamp:   UTC ISO 8601, set at construction time
+  - t_ms:        ms since this event's episode start (perf_counter delta
+                 against ``episode.t0``). Single clock for all timing math
+                 — mixing perf_counter durations with datetime.now() wall
+                 timestamps used to drift on WSL2.
   - step_id:     loop iteration index; None for events outside the step loop
   - episode_id, run_id, depth, root_episode_id,
     parent_episode_id, parent_run_id, parent_step_id
@@ -24,6 +27,7 @@ Event vocabulary:
 """
 from __future__ import annotations
 
+import time
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
@@ -31,14 +35,10 @@ if TYPE_CHECKING:
     from engine import Episode
 
 
-def utc_timestamp() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
 def _base(event_type: str, episode: "Episode", step_id: int | None) -> dict[str, Any]:
     return {
         "type": event_type,
-        "timestamp": utc_timestamp(),
+        "t_ms": int((time.perf_counter() - episode.t0) * 1000),
         "step_id": step_id,
         **episode.to_event_fields(),
     }
@@ -57,6 +57,10 @@ def episode_start(
 ) -> dict[str, Any]:
     return {
         **_base("episode_start", episode, step_id=None),
+        # Wall-clock label for human reading and external-log correlation
+        # (vLLM server logs, system journals). Not used for any timing math
+        # — that's all t_ms (perf_counter).
+        "wall_clock_start": datetime.now(timezone.utc).isoformat(),
         "task_input": task_input,
         "model": model,
         "backend": backend,
@@ -241,6 +245,7 @@ def subagent_end(
     started_at_ms: int,
     ended_at_ms: int,
     duration_ms: int,
+    child_episode_offset_ms: int,
     error: str | None = None,
 ) -> dict[str, Any]:
     payload = {
@@ -255,6 +260,11 @@ def subagent_end(
         "started_at_ms": started_at_ms,
         "ended_at_ms": ended_at_ms,
         "duration_ms": duration_ms,
+        # Offset from parent.episode.t0 to child.episode.t0, in ms. Lets
+        # consumers (visualizer, token_trace_gen) map a child's t_ms into
+        # the parent's frame without crossing the wall clock — pure
+        # perf_counter all the way down.
+        "child_episode_offset_ms": child_episode_offset_ms,
     }
     if error is not None:
         payload["error"] = error

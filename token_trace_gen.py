@@ -41,31 +41,60 @@ def _load_trace(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
-def _collect_llm_calls(trace_path: Path) -> list[dict[str, Any]]:
-    """Walk a trace + all subagent traces; return all llm_call events."""
+def _collect_llm_calls(
+    trace_path: Path,
+    *,
+    anchor_in_root_ms: int,
+    root_iso: str | None,
+) -> list[tuple[dict[str, Any], int]]:
+    """Walk a trace + subagent traces; return ``(call_event, end_ms_in_root)``
+    tuples. Each end_ms_in_root is computed against the root episode start
+    using ``t_ms`` (new traces) or ISO arithmetic (legacy fallback)."""
     rows = _load_trace(trace_path)
-    calls = [r for r in rows if r.get("type") == "llm_call"]
+    if not rows or rows[0].get("type") != "episode_start":
+        return []
+    start = rows[0]
 
+    if "t_ms" in start:
+        start_t_ms = int(start["t_ms"])
+        def to_root_ms(e: dict[str, Any]) -> int:
+            return anchor_in_root_ms + (int(e["t_ms"]) - start_t_ms)
+    else:
+        if root_iso is None:
+            return []
+        root_dt = datetime.fromisoformat(root_iso)
+        def to_root_ms(e: dict[str, Any]) -> int:
+            return int(
+                (datetime.fromisoformat(e["timestamp"]) - root_dt).total_seconds() * 1000
+            )
+
+    out: list[tuple[dict[str, Any], int]] = []
     parent_dir = trace_path.parent
     for r in rows:
-        if r.get("type") != "subagent_end":
-            continue
-        child_path_str = r.get("child_trace_path")
-        if not child_path_str:
-            continue
-        child_path = Path(child_path_str)
-        if not child_path.is_absolute():
-            # Per-root-episode dir layout: child trace is a sibling of parent.
-            child_path = parent_dir / child_path.name
-        if child_path.exists():
-            calls.extend(_collect_llm_calls(child_path))
-    return calls
+        if r.get("type") == "llm_call":
+            out.append((r, to_root_ms(r)))
+        elif r.get("type") == "subagent_end":
+            child_path_str = r.get("child_trace_path")
+            if not child_path_str:
+                continue
+            child_path = Path(child_path_str)
+            if not child_path.is_absolute():
+                # Per-root-episode dir layout: child trace is a sibling of parent.
+                child_path = parent_dir / child_path.name
+            if not child_path.exists():
+                continue
+            child_offset = int(r.get("child_episode_offset_ms", 0))
+            out.extend(_collect_llm_calls(
+                child_path,
+                anchor_in_root_ms=anchor_in_root_ms + child_offset,
+                root_iso=root_iso,
+            ))
+    return out
 
 
-def _llm_call_to_record(call: dict[str, Any], t0: datetime) -> dict[str, Any]:
+def _llm_call_to_record(call: dict[str, Any], end_ms: int) -> dict[str, Any]:
     # The llm_call event is emitted after run_assistant_turn returns, so its
-    # timestamp ≈ end-of-call. Subtract latency to recover the start anchor.
-    end_ms = int((datetime.fromisoformat(call["timestamp"]) - t0).total_seconds() * 1000)
+    # end_ms ≈ end-of-call. Subtract latency to recover the call start.
     duration_ms = int(call.get("latency_ms", 0))
     t_ms = end_ms - duration_ms
     ttft_ms = call.get("ttft_ms")
@@ -89,18 +118,19 @@ def write_tokens_for(root_trace_path: Path) -> Path:
         raise ValueError(f"{root_path}: missing episode_start as first event")
 
     start = rows[0]
-    t0 = datetime.fromisoformat(start["timestamp"])
+    started_at = start.get("wall_clock_start") or start.get("timestamp")
+    root_iso = start.get("timestamp")  # legacy-fallback anchor only
 
-    llm_calls = _collect_llm_calls(root_path)
+    calls = _collect_llm_calls(root_path, anchor_in_root_ms=0, root_iso=root_iso)
     records = sorted(
-        (_llm_call_to_record(c, t0) for c in llm_calls),
+        (_llm_call_to_record(c, end_ms) for c, end_ms in calls),
         key=lambda r: r["t_ms"],
     )
 
     header = {
         "root_episode_id": start.get("episode_id"),
         "model": start.get("model"),
-        "started_at": start["timestamp"],
+        "started_at": started_at,
         "n_calls": len(records),
     }
 

@@ -69,6 +69,7 @@ def spawn(
             child_config[override_key] = params[override_key]
 
     child_episode = Episode.new_child(parent_episode, parent_step_id=context.step_id)
+    child_episode_offset_ms = int((child_episode.t0 - parent_episode.t0) * 1000)
     child_trace_path = (
         Path(child_config.get("output_dir", "traces"))
         / child_episode.root_episode_id
@@ -124,6 +125,7 @@ def spawn(
                 started_at_ms=started_at_ms,
                 ended_at_ms=ended_at_ms,
                 duration_ms=duration_ms,
+                child_episode_offset_ms=child_episode_offset_ms,
             )
         )
         return result["final_text"] or "(subagent produced no final text)"
@@ -142,6 +144,7 @@ def spawn(
             started_at_ms=started_at_ms,
             ended_at_ms=ended_at_ms,
             duration_ms=duration_ms,
+            child_episode_offset_ms=child_episode_offset_ms,
             error=error,
         )
     )

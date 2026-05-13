@@ -62,6 +62,15 @@ def _ms_between(start_iso: str, end_iso: str) -> int:
     return int((datetime.fromisoformat(end_iso) - datetime.fromisoformat(start_iso)).total_seconds() * 1000)
 
 
+def _episode_wall_ms(start: dict[str, Any], end: dict[str, Any]) -> int:
+    """Episode-relative ms from start→end. Prefers ``t_ms`` (single
+    perf_counter clock; new traces). Falls back to ISO ``timestamp`` math
+    for legacy traces written before the t_ms switch."""
+    if "t_ms" in start and "t_ms" in end:
+        return int(end["t_ms"]) - int(start["t_ms"])
+    return _ms_between(start["timestamp"], end["timestamp"])
+
+
 def _wall_ms_for_step(events_in_step: list[dict[str, Any]]) -> int:
     """Wall-clock time for a batch of timed events in one step.
 
@@ -137,7 +146,7 @@ def summarize(rows: list[dict[str, Any]]) -> EpisodeSummary:
 
     total_tool_ms = sum(_wall_ms_for_step(tools) for tools in tool_by_step.values())
     total_subagent_ms = sum(_subagent_ms_for_step(subs) for subs in subagent_by_step.values())
-    total_wall_ms = _ms_between(start["timestamp"], end["timestamp"])
+    total_wall_ms = _episode_wall_ms(start, end)
 
     raw_workload = start.get("workload_info")
     workload_info = raw_workload if isinstance(raw_workload, dict) else None

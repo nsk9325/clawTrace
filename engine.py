@@ -4,7 +4,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +31,10 @@ class Episode:
     parent_episode_id: str | None = None
     parent_run_id: str | None = None
     parent_step_id: int | None = None
+    # perf_counter origin captured at construction. Every event's t_ms is
+    # measured against this — single clock source, so latency_ms summed over
+    # a step is structurally bounded by step_end.t_ms - step_start.t_ms.
+    t0: float = field(default_factory=time.perf_counter, compare=False)
 
     @classmethod
     def new_root(cls) -> "Episode":

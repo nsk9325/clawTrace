@@ -19,21 +19,23 @@ token_trace_gen = _load("token_trace_gen", "token_trace_gen.py")
 
 
 def _episode_start(episode_id="ep_root", model="gpt-4o-mini",
-                   timestamp="2026-04-26T12:00:00.000000+00:00", depth=0):
+                   wall_clock_start="2026-04-26T12:00:00.000000+00:00", depth=0,
+                   t_ms=0):
     return {
         "type": "episode_start",
-        "timestamp": timestamp,
+        "t_ms": t_ms,
+        "wall_clock_start": wall_clock_start,
         "episode_id": episode_id,
         "model": model,
         "depth": depth,
     }
 
 
-def _llm_call(timestamp, latency_ms, ttft_ms, prompt_tokens, completion_tokens,
+def _llm_call(t_ms, latency_ms, ttft_ms, prompt_tokens, completion_tokens,
               cached_tokens=None, episode_id="ep_root", step_id=0):
     return {
         "type": "llm_call",
-        "timestamp": timestamp,
+        "t_ms": t_ms,
         "step_id": step_id,
         "episode_id": episode_id,
         "latency_ms": latency_ms,
@@ -44,25 +46,25 @@ def _llm_call(timestamp, latency_ms, ttft_ms, prompt_tokens, completion_tokens,
     }
 
 
-def _episode_end(episode_id="ep_root", timestamp="2026-04-26T12:00:10.000000+00:00"):
-    return {"type": "episode_end", "timestamp": timestamp, "episode_id": episode_id}
+def _episode_end(episode_id="ep_root", t_ms=10000):
+    return {"type": "episode_end", "t_ms": t_ms, "episode_id": episode_id}
 
 
 def test_single_episode_two_calls(tmp_path):
     trace_path = tmp_path / "ep_root.jsonl"
     rows = [
-        _episode_start(timestamp="2026-04-26T12:00:00.000000+00:00"),
+        _episode_start(),
         _llm_call(
-            timestamp="2026-04-26T12:00:01.450000+00:00",
+            t_ms=1450,
             latency_ms=1450, ttft_ms=320,
             prompt_tokens=1842, completion_tokens=47, cached_tokens=0,
         ),
         _llm_call(
-            timestamp="2026-04-26T12:00:04.200000+00:00", step_id=1,
+            t_ms=4200, step_id=1,
             latency_ms=1100, ttft_ms=280,
             prompt_tokens=2030, completion_tokens=89, cached_tokens=1800,
         ),
-        _episode_end(timestamp="2026-04-26T12:00:05.000000+00:00"),
+        _episode_end(t_ms=5000),
     ]
     trace_path.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
 
@@ -97,32 +99,34 @@ def test_single_episode_two_calls(tmp_path):
 def test_subagent_calls_merged_on_root_timeline(tmp_path):
     child_path = tmp_path / "ep_child.jsonl"
     child_rows = [
-        _episode_start(episode_id="ep_child", depth=1,
-                       timestamp="2026-04-26T12:00:02.000000+00:00"),
+        # Child episode starts t_ms=0 in its own frame (parent tracks the
+        # root-relative offset on subagent_end).
+        _episode_start(episode_id="ep_child", depth=1, t_ms=0),
         _llm_call(
-            timestamp="2026-04-26T12:00:02.500000+00:00",
+            t_ms=500,
             latency_ms=500, ttft_ms=100,
             prompt_tokens=300, completion_tokens=10,
             episode_id="ep_child",
         ),
-        _episode_end(episode_id="ep_child", timestamp="2026-04-26T12:00:03.000000+00:00"),
+        _episode_end(episode_id="ep_child", t_ms=1000),
     ]
     child_path.write_text("\n".join(json.dumps(r) for r in child_rows) + "\n", encoding="utf-8")
 
     parent_path = tmp_path / "ep_root.jsonl"
     parent_rows = [
-        _episode_start(timestamp="2026-04-26T12:00:00.000000+00:00"),
+        _episode_start(),
         _llm_call(
-            timestamp="2026-04-26T12:00:01.000000+00:00",
+            t_ms=1000,
             latency_ms=1000, ttft_ms=200,
             prompt_tokens=500, completion_tokens=20,
         ),
         {
             "type": "subagent_end",
-            "timestamp": "2026-04-26T12:00:03.000000+00:00",
+            "t_ms": 3000,
+            "child_episode_offset_ms": 2000,
             "child_trace_path": str(child_path),
         },
-        _episode_end(timestamp="2026-04-26T12:00:04.000000+00:00"),
+        _episode_end(t_ms=4000),
     ]
     parent_path.write_text("\n".join(json.dumps(r) for r in parent_rows) + "\n", encoding="utf-8")
 
@@ -142,17 +146,54 @@ def test_subagent_calls_merged_on_root_timeline(tmp_path):
 def test_missing_cached_tokens_serialized_as_null(tmp_path):
     trace_path = tmp_path / "ep_root.jsonl"
     rows = [
-        _episode_start(timestamp="2026-04-26T12:00:00.000000+00:00"),
+        _episode_start(),
         _llm_call(
-            timestamp="2026-04-26T12:00:01.000000+00:00",
+            t_ms=1000,
             latency_ms=1000, ttft_ms=200,
             prompt_tokens=100, completion_tokens=10,
             cached_tokens=None,
         ),
-        _episode_end(timestamp="2026-04-26T12:00:02.000000+00:00"),
+        _episode_end(t_ms=2000),
     ]
     trace_path.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
 
     out = token_trace_gen.write_tokens_for(trace_path)
     record = json.loads(out.read_text(encoding="utf-8").splitlines()[1])
     assert record["cached_tokens"] is None
+
+
+def test_falls_back_to_iso_timestamps_for_legacy_traces(tmp_path):
+    """Legacy traces have no ``t_ms`` — only ISO ``timestamp``. Verify the
+    ISO fallback path still produces the same root-relative t_ms records."""
+    trace_path = tmp_path / "ep_root.jsonl"
+    rows = [
+        {
+            "type": "episode_start",
+            "timestamp": "2026-04-26T12:00:00.000000+00:00",
+            "episode_id": "ep_root",
+            "model": "gpt-4o-mini",
+            "depth": 0,
+        },
+        {
+            "type": "llm_call",
+            "timestamp": "2026-04-26T12:00:01.450000+00:00",
+            "step_id": 0,
+            "episode_id": "ep_root",
+            "latency_ms": 1450,
+            "ttft_ms": 320,
+            "prompt_tokens": 100,
+            "completion_tokens": 10,
+            "cached_tokens": None,
+        },
+        {
+            "type": "episode_end",
+            "timestamp": "2026-04-26T12:00:02.000000+00:00",
+            "episode_id": "ep_root",
+        },
+    ]
+    trace_path.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+
+    out = token_trace_gen.write_tokens_for(trace_path)
+    record = json.loads(out.read_text(encoding="utf-8").splitlines()[1])
+    assert record["t_ms"] == 0
+    assert record["duration_ms"] == 1450

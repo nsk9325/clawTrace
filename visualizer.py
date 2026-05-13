@@ -71,6 +71,32 @@ def _ms_since(t0: datetime, iso: str) -> int:
     return int((datetime.fromisoformat(iso) - t0).total_seconds() * 1000)
 
 
+def _make_to_root_ms(
+    start_event: dict[str, Any],
+    *,
+    anchor_in_root_ms: int,
+    root_iso: str | None,
+):
+    """Build a fn(event)→root-relative ms for one trace file.
+
+    New traces (``t_ms`` present): anchor + (event.t_ms - start.t_ms).
+    The anchor is 0 for root and ``parent_anchor + child_episode_offset_ms``
+    for each subagent trace reached via recursion.
+
+    Legacy traces fall back to ISO ``timestamp`` arithmetic against the
+    root episode's wall-clock start.
+    """
+    if "t_ms" in start_event:
+        start_t_ms = int(start_event["t_ms"])
+        return lambda e: anchor_in_root_ms + (int(e["t_ms"]) - start_t_ms)
+    if root_iso is None:
+        raise ValueError("legacy trace lacks both t_ms and a root ISO anchor")
+    root_dt = datetime.fromisoformat(root_iso)
+    return lambda e: int(
+        (datetime.fromisoformat(e["timestamp"]) - root_dt).total_seconds() * 1000
+    )
+
+
 def _short(ep_id: str) -> str:
     return ep_id.replace("episode_", "")
 
@@ -97,8 +123,8 @@ def _tool_detail(tool_name: str, params: dict[str, Any]) -> str:
 
 # --------------------------------------------------------------- Layer 1: build
 
-def _bars_from_llm_call(r: dict[str, Any], t0: datetime, server_lane: str) -> list[Bar]:
-    end_ms = _ms_since(t0, r["timestamp"])
+def _bars_from_llm_call(r: dict[str, Any], to_root_ms, server_lane: str) -> list[Bar]:
+    end_ms = to_root_ms(r)
     start_ms = end_ms - int(r.get("latency_ms", 0))
     label = str(r.get("model", ""))
     step = r.get("step_id")
@@ -113,13 +139,13 @@ def _bars_from_llm_call(r: dict[str, Any], t0: datetime, server_lane: str) -> li
     return [Bar(server_lane, "llm", start_ms, end_ms, label, "", step, "ok")]
 
 
-def _bar_from_tool_call(r: dict[str, Any], t0: datetime, client_lane: str) -> Bar | None:
+def _bar_from_tool_call(r: dict[str, Any], to_root_ms, client_lane: str) -> Bar | None:
     # Legacy traces (pre-refactor) emitted a tool_call event for spawn_subagent
     # alongside subagent_start/end; the spawn is already represented by the
     # subagent_span bar, so skip the legacy duplicate.
     if r.get("tool_name") == "spawn_subagent":
         return None
-    end_ms = _ms_since(t0, r["timestamp"])
+    end_ms = to_root_ms(r)
     name = str(r.get("tool_name", ""))
     return Bar(
         lane=client_lane, kind="tool",
@@ -130,8 +156,8 @@ def _bar_from_tool_call(r: dict[str, Any], t0: datetime, client_lane: str) -> Ba
     )
 
 
-def _subagent_span_bar(r: dict[str, Any], t0: datetime, client_lane: str) -> Bar:
-    end_ms = _ms_since(t0, r["timestamp"])
+def _subagent_span_bar(r: dict[str, Any], to_root_ms, client_lane: str) -> Bar:
+    end_ms = to_root_ms(r)
     child_ep = r.get("child_episode_id", "<unknown>")
     return Bar(
         lane=client_lane, kind="subagent_span",
@@ -156,7 +182,8 @@ def _resolve_child_path(child_path_str: str | None, parent_dir: Path) -> Path | 
 def _walk_trace(
     trace_path: Path,
     *,
-    t0: datetime,
+    anchor_in_root_ms: int,
+    root_iso: str | None,
     depth: int,
     lanes: list[Lane],
     bars: list[Bar],
@@ -166,7 +193,8 @@ def _walk_trace(
     if not rows or rows[0].get("type") != "episode_start":
         return
 
-    ep_id = rows[0]["episode_id"]
+    start_event = rows[0]
+    ep_id = start_event["episode_id"]
     server_lane = f"{ep_id}:server"
     client_lane = f"{ep_id}:client"
     indent = "  " * depth
@@ -176,23 +204,37 @@ def _walk_trace(
     lanes.append(Lane(client_lane, f"{indent}{arrow}{name} — client", ep_id, depth))
 
     parent_dir = trace_path.parent
+    to_root_ms = _make_to_root_ms(
+        start_event, anchor_in_root_ms=anchor_in_root_ms, root_iso=root_iso
+    )
 
     for r in rows:
         kind = r["type"]
         if kind == "step_start" and step_boundaries is not None:
-            step_boundaries.append(_ms_since(t0, r["timestamp"]))
+            step_boundaries.append(to_root_ms(r))
         elif kind == "llm_call":
-            bars.extend(_bars_from_llm_call(r, t0, server_lane))
+            bars.extend(_bars_from_llm_call(r, to_root_ms, server_lane))
         elif kind == "tool_call":
-            bar = _bar_from_tool_call(r, t0, client_lane)
+            bar = _bar_from_tool_call(r, to_root_ms, client_lane)
             if bar is not None:
                 bars.append(bar)
         elif kind == "subagent_end":
-            bars.append(_subagent_span_bar(r, t0, client_lane))
+            bars.append(_subagent_span_bar(r, to_root_ms, client_lane))
             child = _resolve_child_path(r.get("child_trace_path"), parent_dir)
             if child is not None:
-                _walk_trace(child, t0=t0, depth=depth + 1, lanes=lanes, bars=bars,
-                            step_boundaries=None)
+                # New traces carry child_episode_offset_ms (parent.t0 → child.t0
+                # in ms). For legacy ISO-only traces it's absent — child still
+                # anchors via its own episode_start timestamp.
+                child_offset = int(r.get("child_episode_offset_ms", 0))
+                _walk_trace(
+                    child,
+                    anchor_in_root_ms=anchor_in_root_ms + child_offset,
+                    root_iso=root_iso,
+                    depth=depth + 1,
+                    lanes=lanes,
+                    bars=bars,
+                    step_boundaries=None,
+                )
 
 
 def _split_client_lanes(lanes: list[Lane], bars: list[Bar]) -> list[Lane]:
@@ -247,22 +289,38 @@ def build_timeline(root_trace_path: Path) -> Timeline:
     if end is None:
         raise ValueError(f"{root_trace_path}: missing episode_end (run may have been killed)")
 
-    root_iso = rows[0]["timestamp"]
-    t0 = datetime.fromisoformat(root_iso)
+    start = rows[0]
+    # Wall-clock label for the chart title. New traces have wall_clock_start;
+    # legacy traces only have timestamp. Both are ISO strings.
+    root_started_at = str(start.get("wall_clock_start") or start.get("timestamp", ""))
+    # Used only as the legacy-fallback anchor when a sub-trace lacks t_ms.
+    root_iso = str(start.get("timestamp")) if "timestamp" in start else None
 
     lanes: list[Lane] = []
     bars: list[Bar] = []
     step_boundaries: list[int] = []
-    _walk_trace(root_trace_path, t0=t0, depth=0, lanes=lanes, bars=bars,
-                step_boundaries=step_boundaries)
+    _walk_trace(
+        root_trace_path,
+        anchor_in_root_ms=0,
+        root_iso=root_iso,
+        depth=0,
+        lanes=lanes,
+        bars=bars,
+        step_boundaries=step_boundaries,
+    )
     lanes = _split_client_lanes(lanes, bars)
+
+    if "t_ms" in start and "t_ms" in end:
+        total_wall_ms = int(end["t_ms"]) - int(start["t_ms"])
+    else:
+        total_wall_ms = _ms_since(datetime.fromisoformat(root_iso), end["timestamp"])
 
     return Timeline(
         lanes=lanes,
         bars=bars,
-        root_episode_id=rows[0]["episode_id"],
-        root_started_at=root_iso,
-        total_wall_ms=_ms_since(t0, end["timestamp"]),
+        root_episode_id=start["episode_id"],
+        root_started_at=root_started_at,
+        total_wall_ms=total_wall_ms,
         step_boundaries_ms=step_boundaries,
     )
 
