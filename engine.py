@@ -4,7 +4,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -112,6 +112,7 @@ class RuntimeContext:
     step_id: int
     tool_call_id: str
     cfg: RunConfig
+    env_overrides: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -132,12 +133,14 @@ class ToolExecutor:
         writer: TraceWriter,
         episode: Episode,
         budget: SubagentBudget,
+        env_overrides: dict[str, str] | None = None,
     ):
         self.cfg = cfg
         self.writer = writer
         self.episode = episode
         self.budget = budget
         self._cfg_dict = cfg.to_dict()
+        self.env_overrides: dict[str, str] = dict(env_overrides or {})
 
     def execute(self, tool_calls: list[dict[str, Any]], step_id: int) -> list[ToolResult]:
         origin = time.perf_counter()
@@ -193,6 +196,7 @@ class ToolExecutor:
             step_id=step_id,
             tool_call_id=tool_call["id"],
             cfg=self.cfg,
+            env_overrides=self.env_overrides,
         )
         is_subagent_call = tool_call["name"] == subagent.SUBAGENT_TOOL_NAME
 
@@ -236,6 +240,21 @@ class ToolExecutor:
             latency_ms=latency_ms,
             exit_status=exit_status,
         )
+
+
+def _stop_reason_for(turn: AssistantTurn) -> str | None:
+    """Map an assistant turn to the step's stop_reason.
+
+    Returns ``None`` (= continue) when the turn produced tool calls.
+    Otherwise distinguishes natural termination from budget exhaustion:
+    a zero-tool-call turn with ``finish_reason="length"`` is a truncation,
+    not a deliberate stop — episode_end will mark it ``incomplete``.
+    """
+    if turn.tool_calls:
+        return None
+    if turn.finish_reason == "length":
+        return "truncated"
+    return "no_tool_calls"
 
 
 def _text_preview(text: str, max_length: int = 200) -> str:
@@ -284,6 +303,8 @@ def run_episode(
     episode: Episode | None = None,
     budget: SubagentBudget | None = None,
     workload_info: dict[str, Any] | None = None,
+    env_setup_payload: dict[str, Any] | None = None,
+    env_overrides: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     merged = dict(load_config())
     if config:
@@ -325,6 +346,9 @@ def run_episode(
             )
         )
 
+        if env_setup_payload is not None:
+            writer.write(events.env_setup(episode, **env_setup_payload))
+
         if episode.depth == 0 and cfg.subagent_parallelism != "serial":
             writer.write(
                 events.config_warning(
@@ -335,7 +359,7 @@ def run_episode(
                 )
             )
 
-        executor = ToolExecutor(cfg, writer, episode, budget)
+        executor = ToolExecutor(cfg, writer, episode, budget, env_overrides=env_overrides)
 
         for step_id in range(cfg.max_steps):
             writer.write(events.step_start(episode, step_id=step_id, history_length=len(memory)))
@@ -367,7 +391,7 @@ def run_episode(
             for result in tool_results:
                 memory.append_tool(result.tool_call_id, result.name, result.output)
 
-            stop_reason = "no_tool_calls" if not assistant_turn.tool_calls else None
+            stop_reason = _stop_reason_for(assistant_turn)
 
             writer.write(
                 events.context_update(

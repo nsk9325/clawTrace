@@ -11,7 +11,11 @@
 #      → emits .jsonl, .diff, .predictions.json under traces/<episode>/
 #   4. run analyzer.py and token_trace_gen.py on the produced trace
 #      → adds .analysis.txt and .tokens.jsonl alongside
-#   5. remove the clone (trap fires on EXIT/INT/TERM so killed runs don't leak)
+#   5. render gantt_maker.py and tokenvisualizer.py
+#      → adds .gantt.png + .gantt.json and .tokens.png
+#   6. run local_eval.py against the predictions file
+#      → writes eval-logs/<episode_id>/report.json (resolved/unresolved + per-test detail)
+#   7. remove the clone (trap fires on EXIT/INT/TERM so killed runs don't leak)
 #
 # Sibling to run_swebench.sh, which assumes the repo is already cloned and
 # leaves it in place.
@@ -19,7 +23,18 @@
 set -uo pipefail
 
 cd "$(dirname "$0")"
-source .venv/bin/activate
+if [ -z "${VIRTUAL_ENV:-}" ]; then
+    for cand in .venv ../venv-clawtrace; do
+        if [ -f "$cand/bin/activate" ]; then
+            # shellcheck disable=SC1090
+            source "$cand/bin/activate"
+            break
+        fi
+    done
+    if [ -z "${VIRTUAL_ENV:-}" ]; then
+        echo "Warning: no venv activated and no .venv/ or ../venv-clawtrace/ found; using \$(which python)" >&2
+    fi
+fi
 
 if [ "$#" -ne 1 ]; then
     echo "Usage: $0 <line_number>" >&2
@@ -104,12 +119,38 @@ rc=${PIPESTATUS[0]}
 
 trace=$(grep -oE 'trace=[^ ]+' "$output_file" | head -n1 | sed 's/^trace=//')
 if [ -n "$trace" ] && [ -f "$trace" ]; then
+    trace_stem="${trace%.jsonl}"
+    run_id="$(basename "$(dirname "$trace")")"
+
     echo
     echo "==> Analyzing $trace"
     python analyzer.py "$trace"
+
     echo
     echo "==> Generating token trace for $trace"
     python token_trace_gen.py "$trace"
+
+    echo
+    echo "==> Rendering Gantt chart for $trace"
+    python gantt_maker.py "$trace"
+
+    tokens_jsonl="${trace_stem}.tokens.jsonl"
+    if [ -f "$tokens_jsonl" ]; then
+        echo
+        echo "==> Rendering token plot for $tokens_jsonl"
+        python tokenvisualizer.py "$tokens_jsonl"
+    fi
+
+    predictions="${trace_stem}.predictions.json"
+    if [ -f "$predictions" ]; then
+        echo
+        echo "==> Running local eval against $predictions"
+        python local_eval.py "$predictions" \
+            --run-id "$run_id" \
+            --instance-ids "$instance_id"
+    else
+        echo "Warning: no predictions file at $predictions; skipping local eval" >&2
+    fi
 else
     echo "Warning: no trace path found in profile_swebench.py output" >&2
 fi

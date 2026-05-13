@@ -1,29 +1,17 @@
 from __future__ import annotations
 
-import importlib.util
 import json
-import sys
 import tempfile
 import time
 from pathlib import Path
 
+from conftest import load_module
 
-def _load_module(module_name: str, file_name: str):
-    module_path = Path(__file__).resolve().parent.parent / file_name
-    spec = importlib.util.spec_from_file_location(module_name, module_path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Could not load module from {module_path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-_load_module("config", "config.py")
-llm = _load_module("llm", "llm.py")
-_load_module("tools", "tools.py")
-_load_module("trace", "trace.py")
-engine = _load_module("engine", "engine.py")
+load_module("config", "config.py")
+llm = load_module("llm", "llm.py")
+load_module("tools", "tools.py")
+load_module("trace", "trace.py")
+engine = load_module("engine", "engine.py")
 
 
 def _build_executor(tmp_path, cfg_overrides=None):
@@ -361,6 +349,39 @@ def test_run_episode_ignores_finish_reason_for_loop_control(tmp_path):
     assert rows[10]["stop_reason"] == "no_tool_calls"
 
 
+def test_run_episode_marks_length_truncated_turn_as_truncated_incomplete(tmp_path):
+    """A zero-tool-call turn with finish_reason='length' is budget exhaustion,
+    not a successful stop — the trace must surface that distinction."""
+    trace_path = tmp_path / "episode_truncated.jsonl"
+    turns = [
+        llm.AssistantTurn(
+            text="<think>thinking ran out of budget...",
+            tool_calls=[],
+            input_tokens=100,
+            output_tokens=8192,
+            latency_ms=10,
+            ttft_ms=2,
+            decode_time_ms=8,
+            measurement="client_streaming",
+            finish_reason="length",
+        ),
+    ]
+
+    result = _with_fake_turns(
+        turns,
+        lambda: engine.run_episode(trace_path=trace_path, task_input="Long task"),
+    )
+
+    rows = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
+    step_end = next(r for r in rows if r["type"] == "step_end")
+    episode_end = next(r for r in rows if r["type"] == "episode_end")
+
+    assert step_end["stop_reason"] == "truncated"
+    assert episode_end["stop_reason"] == "truncated"
+    assert episode_end["status"] == "incomplete"
+    assert result["status"] == "incomplete"
+
+
 def test_subagent_budget_depth_rejects_when_parent_depth_hits_cap():
     import config as config_mod
     cfg = config_mod.RunConfig.from_dict({
@@ -483,7 +504,7 @@ def test_spawn_subagent_disabled_returns_error_when_called(tmp_path):
 
 
 def test_runs_per_task_produces_distinct_episodes(tmp_path):
-    runner = _load_module("runner", "runner.py")
+    runner = load_module("runner", "runner.py")
 
     turns = [
         llm.AssistantTurn(

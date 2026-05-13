@@ -9,3 +9,5 @@ context.md
 vllm.md
 sb-cli-reports/
 implement.md
+eval-logs/
+swebench-envs/

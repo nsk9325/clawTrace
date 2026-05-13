@@ -1,25 +1,12 @@
 from __future__ import annotations
 
-import importlib.util
 import json
-import sys
-from pathlib import Path
 
 import pytest
 
+from conftest import load_module
 
-def _load_module(module_name: str, file_name: str):
-    module_path = Path(__file__).resolve().parent.parent / file_name
-    spec = importlib.util.spec_from_file_location(module_name, module_path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Could not load module from {module_path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-analyzer = _load_module("analyzer", "analyzer.py")
+analyzer = load_module("analyzer", "analyzer.py")
 
 
 def _episode_start(episode_id="ep_a", **overrides):

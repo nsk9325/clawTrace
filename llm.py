@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 from dataclasses import dataclass
@@ -9,6 +10,13 @@ from typing import Any
 from openai import OpenAI
 
 from memory import Memory
+
+
+# `swebench` runs `logging.basicConfig(level=INFO)` at import time, promoting
+# the root logger to INFO and surfacing one httpx INFO line per LLM call.
+# Pin the HTTP-client loggers back to WARNING.
+for _noisy in ("httpx", "httpcore", "openai._base_client", "openai._client"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 
 PROVIDERS: dict[str, dict[str, Any]] = {

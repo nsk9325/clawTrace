@@ -1,6 +1,10 @@
 # Runtime
 openai>=1.75.0,<2.0.0
 matplotlib>=3.7,<4.0
+# Used by env_setup.py to look up per-(repo, version) install recipes from
+# MAP_REPO_VERSION_TO_SPECS. Optional at import time — env_setup falls back to
+# status="skipped" when this isn't installed.
+swebench>=4.0,<5.0
 
 # Development
 pytest>=8.0.0,<9.0.0

@@ -8,17 +8,17 @@ from typing import Any
 
 @dataclass(frozen=True)
 class RunConfig:
-    max_steps: int = 20
+    max_steps: int = 100
     timeout_s: int = 300
-    backend: str = "openai"
-    model: str = "gpt-4o-mini"
+    backend: str = "custom"
+    model: str = "Qwen/Qwen3-Coder-30B-A3B-Instruct"
     temperature: float = 0.0
-    max_tokens: int = 512
+    max_tokens: int = 16384
     tool_timeout_s: int = 30
     output_dir: str = "traces"
     openai_base_url: str = ""
-    custom_base_url: str = ""
-    custom_api_key: str = ""
+    custom_base_url: str = "http://localhost:8003/v1/"
+    custom_api_key: str = "EMPTY"
     vllm_metrics_url: str = ""
     allow_parallel_tools: bool = False
     max_parallel_tools: int = 4

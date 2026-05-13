@@ -2,10 +2,18 @@ from __future__ import annotations
 
 import difflib
 import os
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
+
+
+# Commands the agent must not run on a shared host — they can hit other users'
+# processes, escalate privileges, or take down system services.
+_BASH_DENYLIST = re.compile(
+    r"(?:^|[\s;&|`(])(sudo|pkill|killall|kill|systemctl|service|reboot|shutdown|halt|poweroff|init)\b"
+)
 
 
 @dataclass
@@ -80,11 +88,15 @@ def _read_file(file_path: str, limit: int | None = None, offset: int | None = No
 
     try:
         lines = path.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+        total = len(lines)
+        if total == 0:
+            return "(file is empty)"
         start = offset or 0
+        if start >= total:
+            return f"Error: offset {start} past EOF; file has {total} lines"
         chunk = lines[start:start + limit] if limit else lines[start:]
-        if not chunk:
-            return "(empty file)"
-        return "".join(f"{start + index + 1:6}\t{line}" for index, line in enumerate(chunk))
+        body = "".join(f"{start + index + 1:6}\t{line}" for index, line in enumerate(chunk))
+        return f"# file has {total} lines\n{body}"
     except Exception as exc:
         return f"Error: {exc}"
 
@@ -243,8 +255,23 @@ def _kill_proc_tree(pid: int) -> None:
             pass
 
 
-def _bash(command: str, timeout: int = 30) -> str:
+def _bash(
+    command: str,
+    timeout: int = 30,
+    env_overrides: dict[str, str] | None = None,
+) -> str:
     import sys
+
+    match = _BASH_DENYLIST.search(command)
+    if match:
+        return (
+            f"Error: command refused — `{match.group(1)}` is not permitted on "
+            "this host (shared system; agent cannot signal/kill or escalate)."
+        )
+
+    env = os.environ.copy()
+    if env_overrides:
+        env.update(env_overrides)
 
     kwargs: dict[str, Any] = {
         "shell": True,
@@ -252,6 +279,7 @@ def _bash(command: str, timeout: int = 30) -> str:
         "stderr": subprocess.PIPE,
         "text": True,
         "cwd": os.getcwd(),
+        "env": env,
     }
     if sys.platform != "win32":
         kwargs["start_new_session"] = True
@@ -318,6 +346,7 @@ def _register_builtins() -> None:
             func=lambda params, config, context: _bash(
                 command=params["command"],
                 timeout=params.get("timeout", config.get("tool_timeout_s", 30)),
+                env_overrides=getattr(context, "env_overrides", None) if context else None,
             ),
             read_only=False,
             concurrent_safe=False,

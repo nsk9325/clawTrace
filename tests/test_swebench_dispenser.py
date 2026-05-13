@@ -1,26 +1,14 @@
 from __future__ import annotations
 
-import importlib.util
 import json
 import subprocess
-import sys
 from pathlib import Path
 
 import pytest
 
+from conftest import load_module
 
-def _load_module(module_name: str, file_name: str):
-    module_path = Path(__file__).resolve().parent.parent / file_name
-    spec = importlib.util.spec_from_file_location(module_name, module_path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Could not load module from {module_path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-dispenser = _load_module("swebench_dispenser", "swebench_dispenser.py")
+dispenser = load_module("swebench_dispenser", "swebench_dispenser.py")
 
 
 def _stub_instance(**overrides):
@@ -90,6 +78,22 @@ def test_characterize_treats_blank_hints_as_absent():
     assert dispenser.characterize(inst).hints_present is False
 
 
+def test_characterize_pulls_version_and_env_commit_when_present():
+    inst = _stub_instance(version="4.3", environment_setup_commit="abc123")
+    c = dispenser.characterize(inst)
+    assert c.version == "4.3"
+    assert c.environment_setup_commit == "abc123"
+
+
+def test_characterize_version_defaults_none_when_absent():
+    inst = _stub_instance()
+    inst.pop("version", None)
+    inst.pop("environment_setup_commit", None)
+    c = dispenser.characterize(inst)
+    assert c.version is None
+    assert c.environment_setup_commit is None
+
+
 def test_select_filters_by_repo_length_id_and_limit():
     instances = [
         _stub_instance(instance_id="a", repo="r1", problem_statement="x" * 100),
@@ -104,11 +108,11 @@ def test_select_filters_by_repo_length_id_and_limit():
     assert [i["instance_id"] for i in dispenser.select(instances, repo="r2", limit=2)] == ["b", "c"]
 
 
-def test_render_task_includes_problem_statement_and_repo_path():
+def test_render_task_includes_problem_statement_and_cwd_hint():
     inst = _stub_instance(problem_statement="The bug is X.")
-    out = dispenser.render_task(inst, Path("/tmp/some/repo"))
+    out = dispenser.render_task(inst)
     assert "The bug is X." in out
-    assert "/tmp/some/repo" in out
+    assert "cwd" in out
 
 
 def test_reset_repo_restores_modified_and_removes_untracked(tmp_path):

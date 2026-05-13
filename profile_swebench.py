@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from engine import run_episode
+from env_setup import setup_env
 from swebench_dispenser import (
     build_workload,
     capture_diff,
@@ -38,6 +39,17 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--system-prompt", default=None, help="Shortcut for cfg.system_prompt")
     p.add_argument("--output-dir", default=None, type=Path, help="Shortcut for cfg.output_dir")
     p.add_argument("--config", default=None, help='Arbitrary cfg overrides as JSON, e.g. \'{"model":"gpt-4o","max_steps":20}\'')
+    p.add_argument(
+        "--envs-dir",
+        default=Path("swebench-envs"),
+        type=Path,
+        help="Cache root for per-(repo,version) venvs built by env_setup",
+    )
+    p.add_argument(
+        "--skip-env-setup",
+        action="store_true",
+        help="Don't build a per-instance venv; agent runs against the host interpreter",
+    )
     return p.parse_args(argv)
 
 
@@ -64,6 +76,7 @@ def _run_one(
     repos_dir: Path,
     cfg_overrides: dict[str, Any],
     original_cwd: Path,
+    envs_dir: Path | None,
 ) -> tuple[bool, str]:
     """Run one instance end-to-end. Returns (success, summary_line)."""
     instance_id = instance.get("instance_id", "<unknown>")
@@ -74,6 +87,29 @@ def _run_one(
     except Exception as exc:
         return False, f"{instance_id} status=skipped reason={type(exc).__name__}: {exc}"
 
+    env_setup_payload: dict[str, Any] | None = None
+    env_overrides: dict[str, str] = {}
+    if envs_dir is not None:
+        result_env = setup_env(
+            repo=workload.characteristics.repo,
+            version=str(getattr(workload.characteristics, "version", "") or ""),
+            repo_path=workload.repo_path,
+            envs_root=envs_dir,
+        )
+        env_setup_payload = result_env.to_event_payload()
+        env_overrides = result_env.env_overrides()
+        env_summary = (
+            f"env={result_env.status}"
+            + (f" venv={result_env.venv_path}" if result_env.venv_path else "")
+            + (f" env_ms={result_env.duration_ms}" if result_env.duration_ms else "")
+        )
+        print(f"{workload.instance_id} {env_summary}")
+        if result_env.status == "failed":
+            return False, (
+                f"{workload.instance_id} status=skipped reason=env_setup_failed: "
+                f"{result_env.error}"
+            )
+
     started = time.perf_counter()
     os.chdir(workload.repo_path)
     try:
@@ -81,6 +117,8 @@ def _run_one(
             task_input=workload.task_input,
             config=cfg_overrides,
             workload_info=asdict(workload.characteristics),
+            env_setup_payload=env_setup_payload,
+            env_overrides=env_overrides or None,
         )
         wall_ms = int((time.perf_counter() - started) * 1000)
     except Exception as exc:
@@ -129,13 +167,17 @@ def main(argv: list[str] | None = None) -> int:
 
     cfg_overrides = _build_config(args)
     original_cwd = Path.cwd()
+    envs_dir: Path | None = None
+    if not args.skip_env_setup:
+        envs_dir = args.envs_dir if args.envs_dir.is_absolute() else (Path.cwd() / args.envs_dir).resolve()
+        envs_dir.mkdir(parents=True, exist_ok=True)
     print(f"Running {len(selected)} instance(s)...")
 
     total_started = time.perf_counter()
     success_count = 0
 
     for instance in selected:
-        ok, summary = _run_one(instance, args.repos_dir, cfg_overrides, original_cwd)
+        ok, summary = _run_one(instance, args.repos_dir, cfg_overrides, original_cwd, envs_dir)
         print(summary)
         if ok:
             success_count += 1

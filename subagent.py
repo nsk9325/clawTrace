@@ -98,6 +98,7 @@ def spawn(
             task_input=task,
             episode=child_episode,
             budget=budget,
+            env_overrides=context.env_overrides or None,
         )
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"

@@ -26,6 +26,8 @@ class InstanceCharacteristics:
     num_pass_to_pass: int
     base_commit: str
     created_at: str | None = None
+    version: str | None = None
+    environment_setup_commit: str | None = None
 
 
 @dataclass(frozen=True)
@@ -63,6 +65,8 @@ def characterize(instance: dict[str, Any]) -> InstanceCharacteristics:
         num_pass_to_pass=len(pass_list),
         base_commit=str(instance["base_commit"]),
         created_at=instance.get("created_at"),
+        version=str(instance["version"]) if instance.get("version") is not None else None,
+        environment_setup_commit=instance.get("environment_setup_commit"),
     )
 
 
@@ -113,7 +117,7 @@ def build_workload(instance: dict[str, Any], repos_dir: Path) -> Workload:
     return Workload(
         instance_id=chars.instance_id,
         repo_path=repo_path,
-        task_input=render_task(instance, repo_path),
+        task_input=render_task(instance),
         characteristics=chars,
         raw_instance=instance,
     )
@@ -149,9 +153,14 @@ def capture_diff(repo_path: Path, base_commit: str) -> str:
     return result.stdout
 
 
-def render_task(instance: dict[str, Any], repo_path: Path) -> str:
+def render_task(instance: dict[str, Any]) -> str:
     problem = str(instance.get("problem_statement", "")).strip()
-    return f"{problem}\n\nThe repo is checked out at {repo_path}. Modify files in-place."
+    return (
+        f"{problem}\n\n"
+        "You are running with cwd set to the repo root. "
+        "Use paths relative to the repo root (e.g. `astropy/io/ascii/rst.py`). "
+        "Modify files in-place."
+    )
 
 
 def write_predictions(instance_id: str, model_patch: str, output_path: Path) -> None:

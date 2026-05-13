@@ -21,6 +21,7 @@ Event vocabulary:
   subagent_start, subagent_end     — subagent dispatch
   context_update                   — post-step memory snapshot
   config_warning                   — flagged config combination at run start
+  env_setup                        — per-instance venv build outcome (SWE-bench)
 """
 from __future__ import annotations
 
@@ -187,6 +188,27 @@ def context_update(
         "history_length": history_length,
         "tool_call_count": tool_call_count,
         "executed_tool_call_count": executed_tool_call_count,
+    }
+
+
+def env_setup(
+    episode: "Episode",
+    *,
+    status: str,
+    venv_path: str | None,
+    python_version: str | None,
+    install_commands: list[str],
+    duration_ms: int,
+    error: str | None,
+) -> dict[str, Any]:
+    return {
+        **_base("env_setup", episode, step_id=None),
+        "status": status,
+        "venv_path": venv_path,
+        "python_version": python_version,
+        "install_commands": install_commands,
+        "duration_ms": duration_ms,
+        "error": error,
     }
 
 

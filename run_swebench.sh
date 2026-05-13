@@ -14,7 +14,18 @@
 set -uo pipefail
 
 cd "$(dirname "$0")"
-source .venv/bin/activate
+if [ -z "${VIRTUAL_ENV:-}" ]; then
+    for cand in .venv ../venv-clawtrace; do
+        if [ -f "$cand/bin/activate" ]; then
+            # shellcheck disable=SC1090
+            source "$cand/bin/activate"
+            break
+        fi
+    done
+    if [ -z "${VIRTUAL_ENV:-}" ]; then
+        echo "Warning: no venv activated and no .venv/ or ../venv-clawtrace/ found; using \$(which python)" >&2
+    fi
+fi
 
 output_file=$(mktemp)
 trap 'rm -f "$output_file"' EXIT

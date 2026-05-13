@@ -1,21 +1,10 @@
 from __future__ import annotations
 
-import importlib.util
 import json
-import sys
-from pathlib import Path
 
+from conftest import load_module
 
-def _load(name: str, fname: str):
-    path = Path(__file__).resolve().parent.parent / fname
-    spec = importlib.util.spec_from_file_location(name, path)
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[name] = mod
-    spec.loader.exec_module(mod)
-    return mod
-
-
-token_trace_gen = _load("token_trace_gen", "token_trace_gen.py")
+token_trace_gen = load_module("token_trace_gen", "token_trace_gen.py")
 
 
 def _episode_start(episode_id="ep_root", model="gpt-4o-mini",

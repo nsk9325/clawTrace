@@ -1,23 +1,9 @@
 from __future__ import annotations
 
-import importlib.util
-import sys
-from pathlib import Path
+from conftest import load_module
 
-
-def _load_module(module_name: str, file_name: str):
-    module_path = Path(__file__).resolve().parent.parent / file_name
-    spec = importlib.util.spec_from_file_location(module_name, module_path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Could not load module from {module_path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-config = _load_module("config", "config.py")
-prompts = _load_module("prompts", "prompts.py")
+config = load_module("config", "config.py")
+prompts = load_module("prompts", "prompts.py")
 
 
 def _cfg(**overrides):
@@ -44,6 +30,15 @@ def test_agent_substitutes_environment():
     assert "Working directory:" in out
     assert "Platform:" in out
     assert "Date:" in out
+
+
+def test_agent_includes_exploration_discipline():
+    """The agent prompt nudges search-first behavior so it doesn't loop on
+    paginated re-reads of large files."""
+    out = prompts.build_system_prompt(_cfg(system_prompt="agent"))
+    assert "Exploration discipline" in out
+    assert "Search before reading" in out
+    assert "Don't re-read content already in your transcript" in out
 
 
 def test_agent_includes_parallel_block_only_when_enabled():
